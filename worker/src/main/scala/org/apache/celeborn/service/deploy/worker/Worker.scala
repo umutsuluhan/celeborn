@@ -96,6 +96,27 @@ private[celeborn] class Worker(
 
   private val hasHDFSStorage = conf.hasHDFSStorage
 
+  val rdmaServer: rdma_comms.CommsServer = if (conf.rdmaEnabled) {
+    val server = new rdma_comms.CommsServer(
+      conf.rdmaTransport,
+      conf.rdmaWorkerLocalPeerName,
+      if (conf.rdmaLocalIp.nonEmpty) conf.rdmaLocalIp else workerArgs.host,
+      conf.rdmaBootstrapPort,
+      if (conf.rdmaBufferSize > 0) conf.rdmaBufferSize.toInt else conf.shuffleChunkSize.toInt,
+      conf.rdmaOobPort,
+      conf.rdmaTestJni
+    )
+    logInfo("Celeborn Worker: RDMA transport is enabled.")
+    new Thread(new Runnable {
+      override def run(): Unit = {
+        server.setup()
+      }
+    }, "RDMA-Server-Thread").start()
+    server
+  } else {
+    null
+  }
+
   if (conf.logCelebornConfEnabled) {
     logInfo(getConf)
   }
@@ -607,7 +628,9 @@ private[celeborn] class Worker(
   override def stop(exitKind: Int): Unit = {
     if (!stopped) {
       logInfo("Stopping Worker.")
-
+      if (rdmaServer != null) {
+        rdmaServer.shutdown()
+      }
       if (jvmProfiler != null) {
         jvmProfiler.stop()
       }

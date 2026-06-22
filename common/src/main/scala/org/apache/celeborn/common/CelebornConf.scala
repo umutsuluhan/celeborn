@@ -507,6 +507,18 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   // //////////////////////////////////////////////////////
   //                      Network                        //
   // //////////////////////////////////////////////////////
+  def rdmaTransport: String = get(RDMA_TRANSPORT)
+  def rdmaWorkerLocalPeerName: String = get(RDMA_WORKER_LOCAL_PEER_NAME)
+  def rdmaClientLocalPeerName: String = get(RDMA_CLIENT_LOCAL_PEER_NAME)
+  def rdmaLocalIp: String = get(RDMA_LOCAL_IP)
+  def rdmaRemoteIp: String = get(RDMA_REMOTE_IP)
+  def rdmaBootstrapPort: Int = get(RDMA_BOOTSTRAP_PORT)
+  def rdmaBufferSize: Long = get(RDMA_BUFFER_SIZE)
+  def rdmaOobPort: Int = get(RDMA_OOB_PORT)
+  def rdmaRemotePeerName: String = get(RDMA_REMOTE_PEER_NAME)
+  def rdmaEnabled: Boolean = get(RDMA_ENABLED)
+  def rdmaTestJni: Boolean = get(RDMA_TEST_JNI)
+
   def bindPreferIP: Boolean = get(NETWORK_BIND_PREFER_IP)
   def advertisePreferIP: Boolean = get(NETWORK_ADVERTISE_PREFER_IP)
   def bindWildcardAddress: Boolean = get(NETWORK_WILDCARD_ADDRESS_BIND)
@@ -1890,6 +1902,94 @@ object CelebornConf extends Logging {
       .version("0.2.0")
       .timeConf(TimeUnit.MILLISECONDS)
       .createWithDefaultString("10s")
+
+  val RDMA_TRANSPORT: ConfigEntry[String] =
+    buildConf("celeborn.rdma.transport")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("Transport type for JNI RDMA transfers: TCP or RDMA.")
+      .stringConf
+      .createWithDefault("TCP")
+
+  val RDMA_WORKER_LOCAL_PEER_NAME: ConfigEntry[String] =
+    buildConf("celeborn.rdma.worker.localPeerName")
+      .categories("worker")
+      .version("0.6.3-rdma")
+      .doc("JNI local peer name for the Worker.")
+      .stringConf
+      .createWithDefault("celeborn_worker")
+
+  val RDMA_CLIENT_LOCAL_PEER_NAME: ConfigEntry[String] =
+    buildConf("celeborn.rdma.client.localPeerName")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("JNI local peer name for the Client.")
+      .stringConf
+      .createWithDefault("celeborn_client")
+
+  val RDMA_LOCAL_IP: ConfigEntry[String] =
+    buildConf("celeborn.rdma.localIp")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("JNI local IP address.")
+      .stringConf
+      .createWithDefault("")
+
+  val RDMA_REMOTE_IP: ConfigEntry[String] =
+    buildConf("celeborn.rdma.remoteIp")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("IP address of the remote JNI Server.")
+      .stringConf
+      .createWithDefault("127.0.0.1")
+
+  val RDMA_BOOTSTRAP_PORT: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.bootstrapPort")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("JNI bootstrap port.")
+      .intConf
+      .createWithDefault(0)
+
+  val RDMA_BUFFER_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.rdma.bufferSize")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("JNI buffer size (in bytes). If 0, defaults to chunk size.")
+      .longConf
+      .createWithDefault(0L)
+
+  val RDMA_OOB_PORT: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.oobPort")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("JNI out-of-band communication port.")
+      .intConf
+      .createWithDefault(10000)
+
+  val RDMA_REMOTE_PEER_NAME: ConfigEntry[String] =
+    buildConf("celeborn.rdma.remotePeerName")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("JNI remote peer name for the client connection.")
+      .stringConf
+      .createWithDefault("celeborn_worker")
+
+  val RDMA_ENABLED: ConfigEntry[Boolean] =
+    buildConf("celeborn.rdma.enabled")
+      .categories("common")
+      .version("0.6.3-rdma")
+      .doc("Whether to enable RDMA communication and data path components.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val RDMA_TEST_JNI: ConfigEntry[Boolean] =
+    buildConf("celeborn.rdma.test_jni")
+      .categories("common")
+      .version("0.6.3-rdma")
+      .doc("Whether to trigger JNI Data Plane Read verification test during startup.")
+      .booleanConf
+      .createWithDefault(false)
 
   val NETWORK_MEMORY_ALLOCATOR_ALLOW_CACHE: ConfigEntry[Boolean] =
     buildConf("celeborn.network.memory.allocator.allowCache")

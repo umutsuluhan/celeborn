@@ -185,6 +185,7 @@ public class ShuffleClientImpl extends ShuffleClient {
       JavaUtils.newConcurrentHashMap();
 
   private final TransportMessagesHelper messagesHelper = new TransportMessagesHelper();
+  private rdma_comms.CommsClient rdmaClient;
 
   public ShuffleClientImpl(String appUniqueId, CelebornConf conf, UserIdentifier userIdentifier) {
     super();
@@ -232,6 +233,20 @@ public class ShuffleClientImpl extends ShuffleClient {
     reviveManager = new ReviveManager(this, conf);
 
     logger.info("Created ShuffleClientImpl, appUniqueId: {}", appUniqueId);
+    if (conf.rdmaEnabled()) {
+      logger.info("Celeborn Shuffle CommsClient: RDMA transport is enabled.");
+      String baseName = conf.rdmaClientLocalPeerName();
+      String uniqueClientName = baseName + "_" + java.util.UUID.randomUUID().toString().substring(0, 8);
+      this.rdmaClient = new rdma_comms.CommsClient(
+          conf.rdmaTransport(),
+          uniqueClientName,
+          conf.rdmaRemoteIp(),
+          conf.rdmaOobPort(),
+          conf.rdmaRemotePeerName(),
+          conf.rdmaTestJni()
+      );
+      rdmaClient.setup();
+    }
   }
 
   protected List<TransportClientBootstrap> createBootstraps() {
