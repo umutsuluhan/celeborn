@@ -313,6 +313,10 @@ public abstract class ShuffleClient {
 
   public abstract void excludeFailedFetchLocation(String hostAndFetchPort, Exception e);
 
+  public rdma_comms.CommsClient getRdmaClient() {
+    return null;
+  }
+
   public static void registerDeserializeReducerFileGroupResponseFunction(
       BiFunction<Integer, byte[], ControlMessages.GetReducerFileGroupResponse> function) {
     if (!deserializeReducerFileGroupResponseFunction.isPresent()) {

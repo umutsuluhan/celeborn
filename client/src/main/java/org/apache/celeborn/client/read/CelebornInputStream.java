@@ -631,7 +631,8 @@ public abstract class CelebornInputStream extends InputStream {
                 callback,
                 startChunkIndex,
                 endChunkIndex,
-                checkpointMetadata);
+                checkpointMetadata,
+                shuffleClient.getRdmaClient());
           }
         case S3:
         case OSS:

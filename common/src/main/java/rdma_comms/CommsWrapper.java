@@ -33,11 +33,7 @@ public class CommsWrapper implements AutoCloseable {
     this.nativePtr = nativeCreate();
   }
 
-  /**
-   * Initializes the comms instance.
-   * Equivalent to 'absl::Status comms::Comms::Init(const Params& params)'.
-   */
-  public void init(Map<String, String> params) {
+  public synchronized void init(Map<String, String> params) {
     nativeInit(nativePtr, params);
   }
 
@@ -45,7 +41,7 @@ public class CommsWrapper implements AutoCloseable {
    * Retrieves serialized connection handle of the local instance (opaque bytes).
    * Equivalent to 'absl::StatusOr<size_t> comms::Comms::GetEndpointInfo(opaque_data_t& data)'.
    */
-  public byte[] getEndpointInfo() {
+  public synchronized byte[] getEndpointInfo() {
     return nativeGetEndpointInfo(nativePtr);
   }
 
@@ -57,7 +53,7 @@ public class CommsWrapper implements AutoCloseable {
    * @param opaqueHandleBytes Handle bytes received from the remote peer.
    * @param block If true, blocks until the connection is established.
    */
-  public void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
+  public synchronized void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
     nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
   }
 
@@ -65,7 +61,7 @@ public class CommsWrapper implements AutoCloseable {
    * Explicitly connects to a remote peer.
    * Equivalent to 'absl::Status comms::Comms::Connect(const std::string&)'.
    */
-  public void connect(String peerName) {
+  public synchronized void connect(String peerName) {
     nativeConnect(nativePtr, peerName);
   }
 
@@ -73,7 +69,7 @@ public class CommsWrapper implements AutoCloseable {
    * Registers a local direct ByteBuffer.
    * Equivalent to 'absl::StatusOr<unique_ptr<MemToken>> comms::Comms::RegMem(...)'.
    */
-  public MemToken regMem(ByteBuffer buffer, long size, MemoryType type) {
+  public synchronized MemToken regMem(ByteBuffer buffer, long size, MemoryType type) {
     if (!buffer.isDirect()) {
       throw new IllegalArgumentException("Buffer must be direct");
     }
@@ -85,7 +81,7 @@ public class CommsWrapper implements AutoCloseable {
    * Deregisters a local memory token and closes it.
    * Equivalent to 'absl::Status comms::Comms::DeregMem(MemToken&)'
    */
-  public void deregMem(MemToken token) {
+  public synchronized void deregMem(MemToken token) {
     nativeDeregMem(nativePtr, token.getNativePtr());
     token.close(); 
   }
@@ -94,7 +90,7 @@ public class CommsWrapper implements AutoCloseable {
    * Deserializes a remote memory token from opaque bytes.
    * Equivalent to 'absl::StatusOr<unique_ptr<MemToken>> comms::Comms::GetMemToken(const opaque_data_t&)'.
    */
-  public MemToken getMemToken(byte[] serTok) {
+  public synchronized MemToken getMemToken(byte[] serTok) {
     long tokenPtr = nativeGetMemToken(nativePtr, serTok);
     return new MemToken(tokenPtr);
   }
@@ -103,7 +99,7 @@ public class CommsWrapper implements AutoCloseable {
    * Posts an asynchronous transfer operation.
    * Equivalent to 'absl::StatusOr<unique_ptr<Request>> comms::Comms::PostTransfer(...)'.
    */
-  public Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
+  public synchronized Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
     long reqPtr = nativePostTransfer(nativePtr, remotePeer, op.ordinal(), local.getNativePtr(), remote.getNativePtr(), notificationMessage);
     return new Request(reqPtr);
   }
@@ -112,7 +108,7 @@ public class CommsWrapper implements AutoCloseable {
    * Sends a standalone notification message.
    * Equivalent to 'absl::Status comms::Comms::Notify(const std::string&, const std::string&)'.
    */
-  public void notify(String remotePeer, String message) {
+  public synchronized void notify(String remotePeer, String message) {
     nativeNotify(nativePtr, remotePeer, message);
   }
 
@@ -121,7 +117,7 @@ public class CommsWrapper implements AutoCloseable {
    * Internally extracts the message from 'NotificationProto' in C++ JNI layer.
    * Returns null if no notification is pending.
    */
-  public byte[] getPeerNotification(String remotePeer) {
+  public synchronized byte[] getPeerNotification(String remotePeer) {
     return nativeGetPeerNotification(nativePtr, remotePeer);
   }
 
@@ -130,7 +126,7 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'comms::Comms::~Comms()'.
    */
   @Override
-  public void close() {
+  public synchronized void close() {
     nativeDestroy(nativePtr);
   }
 

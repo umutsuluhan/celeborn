@@ -280,6 +280,23 @@ private[celeborn] class Worker(
     val transportConf =
       Utils.fromCelebornConf(conf, TransportModuleConstants.FETCH_MODULE, numThreads)
     fetchHandler = new FetchHandler(conf, transportConf, workerSource)
+    if (rdmaServer != null) {
+      logInfo("Registering ChunkFetchHandler in rdmaServer...")
+      rdmaServer.registerChunkFetchHandler(new rdma_comms.CommsServer.ChunkFetchHandler {
+        override def fetchChunk(streamId: Long, chunkIndex: Int, target: java.nio.ByteBuffer): Int = {
+          val streamState = fetchHandler.chunkStreamManager.getStreamState(streamId)
+          if (streamState == null) {
+            throw new java.lang.IllegalStateException(s"Stream $streamId is not registered")
+          }
+          val chunkLength = streamState.buffers.getChunkOffsetLength(chunkIndex, 0, Integer.MAX_VALUE)._2.toInt
+          val buffer = fetchHandler.chunkStreamManager.getChunk(streamId, chunkIndex, 0, chunkLength)
+          val nioBuf = buffer.nioByteBuffer()
+          val len = nioBuf.remaining()
+          target.put(nioBuf)
+          len
+        }
+      })
+    }
     val transportContext: TransportContext =
       new TransportContext(
         transportConf,

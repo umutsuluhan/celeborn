@@ -71,6 +71,8 @@ public class WorkerPartitionReader implements PartitionReader {
   private final int fetchMaxReqsInFlight;
   private final long fetchTimeoutMs;
   private boolean closed = false;
+  private final rdma_comms.CommsClient rdmaClient;
+  private final boolean rdmaEnabled;
 
   // for test
   private int fetchChunkRetryCnt;
@@ -93,7 +95,8 @@ public class WorkerPartitionReader implements PartitionReader {
       MetricsCallback metricsCallback,
       int startChunkIndex,
       int endChunkIndex,
-      Optional<PartitionReaderCheckpointMetadata> checkpointMetadata)
+      Optional<PartitionReaderCheckpointMetadata> checkpointMetadata,
+      rdma_comms.CommsClient rdmaClient)
       throws IOException, InterruptedException {
     this.shuffleKey = shuffleKey;
     fetchMaxReqsInFlight = conf.clientFetchMaxReqsInFlight();
@@ -109,7 +112,7 @@ public class WorkerPartitionReader implements PartitionReader {
           @Override
           public void onSuccess(int chunkIndex, ManagedBuffer buffer) {
             // only add the buffer to results queue if this reader is not closed.
-            synchronized (this) {
+            synchronized (WorkerPartitionReader.this) {
               ByteBuf buf = ((NettyManagedBuffer) buffer).getBuf();
               if (!closed) {
                 buf.retain();
@@ -169,6 +172,8 @@ public class WorkerPartitionReader implements PartitionReader {
               : Optional.empty();
     }
     testFetch = conf.testFetchFailure();
+    this.rdmaClient = rdmaClient;
+    this.rdmaEnabled = conf.rdmaEnabled();
     ShuffleClient.incrementTotalReadCounter();
   }
 
@@ -293,23 +298,27 @@ public class WorkerPartitionReader implements PartitionReader {
           callback.onFailure(chunkIndex, new CelebornIOException("Test fetch chunk failure"));
           toFetch--;
         } else {
-          if (!client.isActive()) {
-            try {
-              client = clientFactory.createClient(location.getHost(), location.getFetchPort());
-            } catch (IOException e) {
-              logger.error(
-                  "FetchChunk for shuffleKey: {}, streamId: {}, chunkIndex: {} failed.",
-                  shuffleKey,
-                  streamHandler.getStreamId(),
-                  chunkIndex,
-                  e);
-              ExceptionUtils.wrapAndThrowIOException(e);
-            } catch (InterruptedException e) {
-              logger.error("PartitionReader thread interrupted while fetching chunks.");
-              throw e;
+          if (rdmaClient != null && rdmaEnabled) {
+            rdmaClient.fetchChunk(streamHandler.getStreamId(), chunkIndex, callback);
+          } else {
+            if (!client.isActive()) {
+              try {
+                client = clientFactory.createClient(location.getHost(), location.getFetchPort());
+              } catch (IOException e) {
+                logger.error(
+                    "FetchChunk for shuffleKey: {}, streamId: {}, chunkIndex: {} failed.",
+                    shuffleKey,
+                    streamHandler.getStreamId(),
+                    chunkIndex,
+                    e);
+                ExceptionUtils.wrapAndThrowIOException(e);
+              } catch (InterruptedException e) {
+                logger.error("PartitionReader thread interrupted while fetching chunks.");
+                throw e;
+              }
             }
+            client.fetchChunk(streamHandler.getStreamId(), chunkIndex, fetchTimeoutMs, callback);
           }
-          client.fetchChunk(streamHandler.getStreamId(), chunkIndex, fetchTimeoutMs, callback);
           inflightRequestCount++;
           chunkIndex++;
           toFetch--;
