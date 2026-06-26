@@ -12,6 +12,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import org.apache.celeborn.common.network.client.RpcResponseCallback;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +33,10 @@ public class CommsServer {
   private final int poolSize;
   private final int slotSize;
   private final int numSlots;
+  private final int pushSlotsCount;
+  private final int fetchSlotsCount;
+  private final int pushSlotSize;
+  private final int fetchSlotSize;
 
   // Persistent fields kept alive after setup completes
   private CommsWrapper comms;
@@ -47,14 +54,26 @@ public class CommsServer {
     int fetchChunk(long streamId, int chunkIndex, ByteBuffer target) throws IOException;
   }
 
+  // Callback interface for pushing chunks to Celeborn Worker
+  public interface ChunkPushHandler {
+    /**
+     * Pushes data into the worker's storage.
+     */
+    void pushData(String shuffleKey, String partitionUniqueId, ByteBuf body, RpcResponseCallback callback) throws IOException;
+    void pushMergedData(String shuffleKey, String[] partitionUniqueIds, int[] offsets, ByteBuf body, RpcResponseCallback callback) throws IOException;
+  }
+
   private ChunkFetchHandler chunkFetchHandler;
+  private ChunkPushHandler chunkPushHandler;
   private java.util.concurrent.ExecutorService fetchExecutor;
+  private java.util.concurrent.ExecutorService registerExecutor;
 
   /**
    * Constructor.
    */
   public CommsServer(String transportType, String localPeerName, String localIp, 
-                     int bootstrapPort, int bufferSize, int oobPort, boolean testMode) {
+                     int bootstrapPort, int bufferSize, int oobPort, boolean testMode,
+                     int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;
     this.localIp = localIp;
@@ -62,22 +81,28 @@ public class CommsServer {
     this.oobPort = oobPort;
     this.testMode = testMode;
 
-    // bufferSize is the shuffle chunk size passed from Worker.scala.
-    // Add 4MB headroom for record boundary overflow.
     this.slotSize = bufferSize + 4 * 1024 * 1024;
     
-    // Read slots count from JVM system properties (set by Spark/Celeborn --conf)
-    int slotsCount = Integer.parseInt(System.getProperty("celeborn.rdma.slots.count", "32"));
-    this.numSlots = slotsCount;
-    this.poolSize = slotsCount * this.slotSize;
+    this.pushSlotsCount = pushSlotsCount;
+    this.fetchSlotsCount = fetchSlotsCount;
+    this.pushSlotSize = pushSlotSize;
+    this.fetchSlotSize = fetchSlotSize == 0 ? this.slotSize : fetchSlotSize;
 
-    logger.info("CommsServer initialized with slotSize: {}MB, numSlots: {}, poolSize: {}MB (calculated from bufferSize: {}MB)", 
-        slotSize / (1024 * 1024), numSlots, poolSize / (1024 * 1024), bufferSize / (1024 * 1024));
+    this.numSlots = this.pushSlotsCount + this.fetchSlotsCount;
+    this.poolSize = (this.pushSlotsCount * this.pushSlotSize) + (this.fetchSlotsCount * this.fetchSlotSize);
+
+    logger.info("CommsServer initialized with pushSlots: {} (size: {}KB), fetchSlots: {} (size: {}MB), totalPoolSize: {}MB", 
+        this.pushSlotsCount, this.pushSlotSize / 1024, this.fetchSlotsCount, this.fetchSlotSize / (1024 * 1024), poolSize / (1024 * 1024));
   }
 
   public void registerChunkFetchHandler(ChunkFetchHandler handler) {
     this.chunkFetchHandler = handler;
     logger.info("ChunkFetchHandler registered.");
+  }
+
+  public void registerChunkPushHandler(ChunkPushHandler handler) {
+    this.chunkPushHandler = handler;
+    logger.info("ChunkPushHandler registered.");
   }
 
   /**
@@ -111,6 +136,12 @@ public class CommsServer {
         return t;
       });
 
+      this.registerExecutor = java.util.concurrent.Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "RDMA-Server-Register");
+        t.setDaemon(true);
+        return t;
+      });
+
       // 2. Start OOB TCP Server to accept clients
       new Thread(() -> {
         try {
@@ -124,7 +155,15 @@ public class CommsServer {
               logger.info("OOB Client connected from {}", clientSock.getRemoteSocketAddress());
 
               // Handle client registration in a separate thread to avoid blocking accept loop
-              new Thread(() -> handleClientRegistration(clientSock, clientIp), "RDMA-Server-Register-" + clientIp).start();
+              registerExecutor.submit(() -> {
+                String oldName = Thread.currentThread().getName();
+                Thread.currentThread().setName("RDMA-Server-Register-" + clientIp);
+                try {
+                  handleClientRegistration(clientSock, clientIp);
+                } finally {
+                  Thread.currentThread().setName(oldName);
+                }
+              });
 
             } catch (IOException e) {
               if (running.get() && !listenSock.isClosed()) {
@@ -181,10 +220,12 @@ public class CommsServer {
       CommsWrapper.MemToken clientToken = comms.regMem(clientBuffer, poolSize, CommsWrapper.MemoryType.Dram);
       logger.info("Registered {}MB DRAM buffer pool for client: {}", poolSize / (1024 * 1024), clientPeerName);
 
-      // Initialize Slot Pool
-      BlockingQueue<Integer> freeSlots = new LinkedBlockingQueue<>(this.numSlots);
-      for (int i = 0; i < this.numSlots; i++) {
-        freeSlots.offer(i * this.slotSize);
+      // Initialize Slot Pool (only use fetch slots for fetching)
+      int pushBoundary = this.pushSlotsCount * this.pushSlotSize;
+
+      BlockingQueue<Integer> freeSlots = new LinkedBlockingQueue<>(this.fetchSlotsCount);
+      for (int i = 0; i < this.fetchSlotsCount; i++) {
+        freeSlots.offer(pushBoundary + i * this.fetchSlotSize);
       }
 
       // Start OOB notification poller thread for this client
@@ -260,6 +301,38 @@ public class CommsServer {
           ctx.freeSlots.offer(serverOffset); // Free the slot for reuse
           logger.info("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
               clientPeerName, serverOffset, ctx.freeSlots.size());
+        } else if (msg.startsWith("PUSH_DATA:")) {
+          // Format: PUSH_DATA:slotOffset:length:shuffleKey:partitionUniqueId
+          String[] parts = msg.split(":");
+          int slotOffset = Integer.parseInt(parts[1]);
+          int length = Integer.parseInt(parts[2]);
+          String shuffleKey = parts[3];
+          String partitionUniqueId = parts[4];
+          
+          logger.info("pollClientNotifications: Queuing push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
+          fetchExecutor.submit(() -> {
+            logger.info("handlePushDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+            handlePushDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueId);
+          });
+        } else if (msg.startsWith("PUSH_MERGED_DATA:")) {
+          // Format: PUSH_MERGED_DATA:slotOffset:length:shuffleKey:partitionIdsString;offsetsString
+          String[] parts = msg.split(":", 5);
+          int slotOffset = Integer.parseInt(parts[1]);
+          int length = Integer.parseInt(parts[2]);
+          String shuffleKey = parts[3];
+          String payload = parts[4];
+          
+          String[] subParts = payload.split(";");
+          String[] partitionUniqueIds = subParts[0].split(",");
+          int[] offsets = java.util.Arrays.stream(subParts[1].split(","))
+              .mapToInt(Integer::parseInt)
+              .toArray();
+          
+          logger.info("pollClientNotifications: Queuing merged push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
+          fetchExecutor.submit(() -> {
+            logger.info("handlePushMergedDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+            handlePushMergedDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueIds, offsets);
+          });
         }
 
       } catch (InterruptedException e) {
@@ -271,6 +344,121 @@ public class CommsServer {
       }
     }
     logger.info("RDMA Server Poller thread stopped for client: {}", clientPeerName);
+  }
+
+  private void handlePushDataRequest(ClientContext ctx, int slotOffset, int length, String shuffleKey, String partitionUniqueId) {
+    if (chunkPushHandler == null) {
+      logger.error("handlePushDataRequest: Cannot process PUSH_DATA, ChunkPushHandler is not registered!");
+      sendPushFailed(ctx, slotOffset, "ChunkPushHandler not registered");
+      return;
+    }
+
+    final java.util.concurrent.atomic.AtomicBoolean completed = new java.util.concurrent.atomic.AtomicBoolean(false);
+    ByteBuf body = null;
+    try {
+      // 1. Slice the client's buffer at the slot offset containing the pushed data
+      ByteBuffer duplicate = ctx.localBuffer.duplicate();
+      duplicate.clear();
+      duplicate.position(slotOffset);
+      duplicate.limit(slotOffset + length);
+      ByteBuffer slice = duplicate.slice();
+
+      // 2. Allocate a new pooled direct buffer and copy the data to isolate it from the RDMA slot
+      body = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(length);
+      body.writeBytes(slice);
+
+      // 3. Forward to the registered handler (which writes it to disk/replica)
+      chunkPushHandler.pushData(shuffleKey, partitionUniqueId, body, new RpcResponseCallback() {
+        @Override
+        public void onSuccess(ByteBuffer response) {
+          logger.info("handlePushDataRequest: Push queued successfully for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
+          if (completed.compareAndSet(false, true)) {
+            String reply = "PUSH_COMPLETE:" + slotOffset;
+            try {
+              comms.notify(ctx.peerName, reply);
+            } catch (Exception ne) {
+              logger.error("Server: Failed to send PUSH_COMPLETE to {}", ctx.peerName, ne);
+            }
+          }
+        }
+
+        @Override
+        public void onFailure(Throwable e) {
+          logger.error("handlePushDataRequest: Push failed for slot {} from client {}", slotOffset, ctx.peerName, e);
+          if (completed.compareAndSet(false, true)) {
+            sendPushFailed(ctx, slotOffset, e.getMessage());
+          }
+        }
+      });
+
+      // 4. CRITICAL: Release our initial reference now that the handler has retained it!
+      body.release();
+
+    } catch (Exception e) {
+      logger.error("handlePushDataRequest: Error processing push for slot {} from client {}", slotOffset, ctx.peerName, e);
+      if (completed.compareAndSet(false, true)) {
+        sendPushFailed(ctx, slotOffset, e.getMessage());
+      }
+      if (body != null && body.refCnt() > 0) {
+        body.release();
+      }
+    }
+  }
+
+  private void handlePushMergedDataRequest(ClientContext ctx, int slotOffset, int length, String shuffleKey, String[] partitionUniqueIds, int[] offsets) {
+    if (chunkPushHandler == null) {
+      logger.error("handlePushMergedDataRequest: Cannot process PUSH_MERGED_DATA, ChunkPushHandler is not registered!");
+      sendPushFailed(ctx, slotOffset, "ChunkPushHandler not registered");
+      return;
+    }
+
+    ByteBuf body = null;
+    try {
+      // 1. Slice the client's buffer at the slot offset containing the pushed data (lock-free!)
+      ByteBuffer duplicate = ctx.localBuffer.duplicate();
+      duplicate.clear();
+      duplicate.position(slotOffset);
+      duplicate.limit(slotOffset + length);
+      ByteBuffer slice = duplicate.slice();
+
+      // 2. Allocate a new pooled direct buffer and copy the data to isolate it from the RDMA slot
+      body = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(length);
+      body.writeBytes(slice);
+
+      // 3. Forward to the registered handler
+      chunkPushHandler.pushMergedData(shuffleKey, partitionUniqueIds, offsets, body, new RpcResponseCallback() {
+        @Override
+        public void onSuccess(ByteBuffer response) {
+          logger.info("handlePushMergedDataRequest: Push merged successfully processed for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
+          String reply = "PUSH_COMPLETE:" + slotOffset;
+          try {
+            comms.notify(ctx.peerName, reply);
+          } catch (Exception ne) {
+            logger.error("Server: Failed to send PUSH_COMPLETE to {}", ctx.peerName, ne);
+          }
+        }
+
+        @Override
+        public void onFailure(Throwable e) {
+          logger.error("handlePushMergedDataRequest: Push merged failed for slot {} from client {}", slotOffset, ctx.peerName, e);
+          sendPushFailed(ctx, slotOffset, e.getMessage());
+        }
+      });
+
+    } catch (Exception e) {
+      logger.error("handlePushMergedDataRequest: Error processing push for slot {} from client {}", slotOffset, ctx.peerName, e);
+      sendPushFailed(ctx, slotOffset, e.getMessage());
+    }
+  }
+
+  private void sendPushFailed(ClientContext ctx, int slotOffset, String errorMsg) {
+    String safeError = errorMsg != null ? errorMsg.replace('\n', ' ') : "Unknown error";
+    String reply = "PUSH_FAILED:" + slotOffset + ":" + safeError;
+    try {
+      comms.notify(ctx.peerName, reply);
+    } catch (Exception ne) {
+      logger.error("sendPushFailed: Failed to send PUSH_FAILED reply to {}", ctx.peerName, ne);
+    }
   }
 
   /**
@@ -354,6 +542,9 @@ public class CommsServer {
     running.set(false);
     if (fetchExecutor != null) {
       fetchExecutor.shutdownNow();
+    }
+    if (registerExecutor != null) {
+      registerExecutor.shutdownNow();
     }
     if (listenSock != null) {
       try {

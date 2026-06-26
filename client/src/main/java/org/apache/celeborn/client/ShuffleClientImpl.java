@@ -1302,10 +1302,16 @@ public class ShuffleClientImpl extends ShuffleClient {
       try {
         if (!isPushTargetWorkerExcluded(loc, wrappedCallback)) {
           if (!testRetryRevive) {
-            assert dataClientFactory != null;
-            TransportClient client =
-                dataClientFactory.createClient(loc.getHost(), loc.getPushPort(), partitionId);
-            client.pushData(pushData, pushDataTimeout, wrappedCallback);
+            if (rdmaClient != null && conf.rdmaEnabled()) {
+              logger.info("RDMA_WRITE_PATH: Pushing shuffle data via RDMA client for shuffleKey {}, partitionUniqueId {}, body length {}.",
+                  shuffleKey, loc.getUniqueId(), body.length);
+              rdmaClient.pushData(body, shuffleKey, loc.getUniqueId(), wrappedCallback);
+            } else {
+              assert dataClientFactory != null;
+              TransportClient client =
+                  dataClientFactory.createClient(loc.getHost(), loc.getPushPort(), partitionId);
+              client.pushData(pushData, pushDataTimeout, wrappedCallback);
+            }
           } else {
             wrappedCallback.onFailure(
                 new CelebornIOException(
@@ -1728,9 +1734,23 @@ public class ShuffleClientImpl extends ShuffleClient {
     try {
       if (!isPushTargetWorkerExcluded(batches.get(0).loc, wrappedCallback)) {
         if (!testRetryRevive || remainReviveTimes < 1) {
-          assert dataClientFactory != null;
-          TransportClient client = dataClientFactory.createClient(host, port);
-          client.pushMergedData(mergedData, pushDataTimeout, wrappedCallback);
+          if (rdmaClient != null && conf.rdmaEnabled()) {
+            logger.info("RDMA_WRITE_PATH: Pushing merged shuffle data via RDMA client for shuffleKey {}, partitions {}, total length {}.",
+                shuffleKey, Arrays.toString(partitionUniqueIds), groupedBatchBytesSize);
+            
+            // Extract flat byte array from the composite Netty ByteBuf
+            io.netty.buffer.ByteBuf nettyBuf = ((NettyManagedBuffer) mergedData.body()).getBuf();
+            byte[] bodyBytes = new byte[nettyBuf.readableBytes()];
+            nettyBuf.getBytes(nettyBuf.readerIndex(), bodyBytes);
+            
+            rdmaClient.pushMergedData(bodyBytes, shuffleKey, partitionUniqueIds, offsets, wrappedCallback);
+          } else {
+            assert dataClientFactory != null;
+            TransportClient client = dataClientFactory.createClient(host, port);
+            logger.info("CLIENT_WRITE_PATH: Pushing merged shuffle data via client for shuffleKey {}, partitions {}, total length {}.",
+                shuffleKey, Arrays.toString(partitionUniqueIds), groupedBatchBytesSize);
+            client.pushMergedData(mergedData, pushDataTimeout, wrappedCallback);
+          }
         } else {
           wrappedCallback.onFailure(
               new CelebornIOException(

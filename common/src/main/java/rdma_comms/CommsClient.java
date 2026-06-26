@@ -19,11 +19,13 @@ import io.netty.buffer.Unpooled;
 import org.apache.celeborn.common.network.buffer.ManagedBuffer;
 import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
 import org.apache.celeborn.common.network.client.ChunkReceivedCallback;
+import org.apache.celeborn.common.network.client.RpcResponseCallback;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class CommsClient {
+  private final Map<Integer, RpcResponseCallback> pendingPushes = new ConcurrentHashMap<>();
   private static volatile CommsClient _instance = null;
 
   public static CommsClient getOrCreate(org.apache.celeborn.common.CelebornConf conf) {
@@ -40,7 +42,11 @@ public class CommsClient {
               conf.rdmaRemoteIp(),
               conf.rdmaOobPort(),
               conf.rdmaRemotePeerName(),
-              slotSize
+              slotSize,
+              conf.rdmaPushSlotsCount(),
+              conf.rdmaFetchSlotsCount(),
+              (int) conf.rdmaPushSlotSize(),
+              (int) conf.rdmaFetchSlotSize()
           );
           client.setup();
           _instance = client;
@@ -58,6 +64,10 @@ public class CommsClient {
   private final int oobPort;
   private final String serverPeerName;
   private final int slotSize;
+  private final int pushSlotsCount;
+  private final int fetchSlotsCount;
+  private final int pushSlotSize;
+  private final int fetchSlotSize;
 
   // Persistent objects
   private CommsWrapper comms;
@@ -70,7 +80,10 @@ public class CommsClient {
   private long localBaseAddress;
 
   // Slot Management
-  private BlockingQueue<Integer> freeSlots;
+  private BlockingQueue<Integer> pushFreeSlots;
+  private BlockingQueue<Integer> fetchFreeSlots;
+  private int numSlots;
+  private int pushBoundary;
   private final Map<String, FetchTask> pendingTasks = new ConcurrentHashMap<>();
   private final java.util.Queue<FetchRequest> waitingQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
   
@@ -88,13 +101,18 @@ public class CommsClient {
    * @param serverPeerName Name of the remote server.
    */
   public CommsClient(String transportType, String localPeerName, String serverIp, 
-                int oobPort, String serverPeerName, int slotSize) {
+                int oobPort, String serverPeerName, int slotSize,
+                int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;
     this.serverIp = serverIp;
     this.oobPort = oobPort;
     this.serverPeerName = serverPeerName;
     this.slotSize = slotSize;
+    this.pushSlotsCount = pushSlotsCount;
+    this.fetchSlotsCount = fetchSlotsCount;
+    this.pushSlotSize = pushSlotSize;
+    this.fetchSlotSize = fetchSlotSize == 0 ? slotSize : fetchSlotSize;
   }
 
   /**
@@ -204,13 +222,20 @@ public class CommsClient {
         this.remoteToken = comms.getMemToken(remoteTokenOpaque);
         this.localBaseAddress = CommsWrapper.getDirectBufferAddress(localBuffer);
 
-        // 5. Initialize Slot Pool
-        int numSlots = (int) (remoteSize / slotSize);
-        this.freeSlots = new LinkedBlockingQueue<>(numSlots);
-        for (int i = 0; i < numSlots; i++) {
-          freeSlots.offer(i * slotSize);
+        // 5. Initialize Slot Pool (Partitioned push and fetch)
+        this.pushBoundary = this.pushSlotsCount * this.pushSlotSize;
+        this.numSlots = this.pushSlotsCount + this.fetchSlotsCount;
+
+        this.pushFreeSlots = new LinkedBlockingQueue<>(this.pushSlotsCount);
+        for (int i = 0; i < this.pushSlotsCount; i++) {
+          pushFreeSlots.offer(i * this.pushSlotSize);
         }
-        logger.info("Initialized local RDMA buffer pool with {} slots of {}MB.", numSlots, slotSize / (1024 * 1024));
+        this.fetchFreeSlots = new LinkedBlockingQueue<>(this.fetchSlotsCount);
+        for (int i = 0; i < this.fetchSlotsCount; i++) {
+          fetchFreeSlots.offer(this.pushBoundary + i * this.fetchSlotSize);
+        }
+        logger.info("Initialized local RDMA buffer pool with {} push slots (size: {}KB) and {} fetch slots (size: {}MB). Push boundary: {}MB", 
+            this.pushSlotsCount, this.pushSlotSize / 1024, this.fetchSlotsCount, this.fetchSlotSize / (1024 * 1024), this.pushBoundary / (1024 * 1024));
 
         // 6. Start Poller and Executor
         this.transferExecutor = Executors.newFixedThreadPool(8, r -> {
@@ -241,16 +266,190 @@ public class CommsClient {
       return;
     }
 
-    Integer slot = freeSlots.poll();
+    Integer slot = fetchFreeSlots.poll();
     if (slot != null) {
-      logger.info("fetchChunk: Acquired slot offset {} for chunk {}_{} immediately. Free slots: {}, Queue size: {}", 
-          slot, streamId, chunkIndex, freeSlots.size(), waitingQueue.size());
+      logger.info("fetchChunk: Acquired fetch slot offset {} for chunk {}_{} immediately. Free fetch slots: {}, Queue size: {}", 
+          slot, streamId, chunkIndex, fetchFreeSlots.size(), waitingQueue.size());
       dispatchFetch(streamId, chunkIndex, callback, slot);
     } else {
-      logger.info("fetchChunk: No slots available for chunk {}_{}. Queueing request. Free slots: 0, Queue size: {}", 
+      logger.info("fetchChunk: No fetch slots available for chunk {}_{}. Queueing request. Free fetch slots: 0, Queue size: {}", 
           streamId, chunkIndex, waitingQueue.size() + 1);
       waitingQueue.offer(new FetchRequest(streamId, chunkIndex, callback));
     }
+  }
+
+  /**
+   * Asynchronously pushes data via RDMA.
+   */
+  public void pushData(byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+    if (!running.get()) {
+      callback.onFailure(new IllegalStateException("CommsClient is not running"));
+      return;
+    }
+
+    Integer slot;
+    try {
+      slot = pushFreeSlots.take(); // Block until a push slot is available
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      callback.onFailure(e);
+      return;
+    }
+
+    logger.info("pushData: Acquired push slot offset {} for push to {} partition {}. Free push slots: {}, Queue size: {}", 
+        slot, shuffleKey, partitionUniqueId, pushFreeSlots.size(), waitingQueue.size());
+    dispatchPush(body, shuffleKey, partitionUniqueId, callback, slot);
+  }
+
+  private void dispatchPush(byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback, int slot) {
+    transferExecutor.submit(() -> {
+      try {
+        // 1. Copy body bytes into localBuffer at slot offset using duplicate to avoid locking
+        ByteBuffer duplicate = localBuffer.duplicate();
+        duplicate.position(slot);
+        duplicate.put(body);
+
+        // 2. Register callback
+        pendingPushes.put(slot, callback);
+
+        // 3. Post RDMA Write
+        long localAddr = localBaseAddress + slot;
+        long remoteAddr = remoteBaseAddress + slot;
+        int length = body.length;
+
+        try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
+             CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
+          
+          localIov.addSegment(localAddr, length, localToken);
+          remoteIov.addSegment(remoteAddr, length, remoteToken);
+
+          // Post RDMA Write
+          try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
+            CommsWrapper.TransferStatus status;
+            long startTime = System.currentTimeMillis();
+            int spinCount = 0;
+            do {
+              status = req.getStatus();
+              if (status.state == CommsWrapper.State.InProgress) {
+                if (spinCount < 100) {
+                  Thread.onSpinWait();
+                  spinCount++;
+                } else {
+                  Thread.yield();
+                }
+              }
+            } while (status.state == CommsWrapper.State.InProgress && running.get());
+
+            long duration = System.currentTimeMillis() - startTime;
+            if (status.state != CommsWrapper.State.Done) {
+              throw new IOException("RDMA Write failed with state: " + status.state + " after " + duration + "ms");
+            }
+            logger.info("dispatchPush: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
+          }
+        }
+
+        // 4. Send OOB notification to server
+        String msg = "PUSH_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionUniqueId;
+        logger.info("dispatchPush: Sending PUSH_DATA OOB for slot {} to server.", slot);
+        comms.notify(serverPeerName, msg);
+
+      } catch (Exception e) {
+        logger.error("dispatchPush: Failed for slot {}", slot, e);
+        pendingPushes.remove(slot);
+        callback.onFailure(e);
+        releaseSlot(slot);
+      }
+    });
+  }
+
+  /**
+   * Asynchronously pushes merged data via RDMA.
+   */
+  public void pushMergedData(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+    if (!running.get()) {
+      callback.onFailure(new IllegalStateException("CommsClient is not running"));
+      return;
+    }
+
+    Integer slot;
+    try {
+      slot = pushFreeSlots.take(); // Block until a push slot is available
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      callback.onFailure(e);
+      return;
+    }
+
+    logger.info("pushMergedData: Acquired push slot offset {} for merged push to {}. Partitions: {}, Free push slots: {}, Queue size: {}", 
+        slot, shuffleKey, java.util.Arrays.toString(partitionUniqueIds), pushFreeSlots.size(), waitingQueue.size());
+    dispatchPushMerged(body, shuffleKey, partitionUniqueIds, offsets, callback, slot);
+  }
+
+  private void dispatchPushMerged(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback, int slot) {
+    transferExecutor.submit(() -> {
+      try {
+        // 1. Copy body bytes into localBuffer at slot offset
+        ByteBuffer duplicate = localBuffer.duplicate();
+        duplicate.position(slot);
+        duplicate.put(body);
+
+        // 2. Register callback
+        pendingPushes.put(slot, callback);
+
+        // 3. Post RDMA Write
+        long localAddr = localBaseAddress + slot;
+        long remoteAddr = remoteBaseAddress + slot;
+        int length = body.length;
+
+        try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
+             CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
+          
+          localIov.addSegment(localAddr, length, localToken);
+          remoteIov.addSegment(remoteAddr, length, remoteToken);
+
+          // Post RDMA Write
+          try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
+            CommsWrapper.TransferStatus status;
+            long startTime = System.currentTimeMillis();
+            int spinCount = 0;
+            do {
+              status = req.getStatus();
+              if (status.state == CommsWrapper.State.InProgress) {
+                if (spinCount < 100) {
+                  Thread.onSpinWait();
+                  spinCount++;
+                } else {
+                  Thread.yield();
+                }
+              }
+            } while (status.state == CommsWrapper.State.InProgress && running.get());
+
+            long duration = System.currentTimeMillis() - startTime;
+            if (status.state != CommsWrapper.State.Done) {
+              throw new IOException("RDMA Write (Merged) failed with state: " + status.state + " after " + duration + "ms");
+            }
+            logger.info("dispatchPushMerged: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
+          }
+        }
+
+        // 4. Serialize partition IDs and offsets arrays
+        String partitionIdsStr = String.join(",", partitionUniqueIds);
+        String offsetsStr = java.util.Arrays.stream(offsets)
+            .mapToObj(String::valueOf)
+            .collect(java.util.stream.Collectors.joining(","));
+
+        // 5. Send PUSH_MERGED_DATA OOB notification to server
+        String msg = "PUSH_MERGED_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionIdsStr + ";" + offsetsStr;
+        logger.info("dispatchPushMerged: Sending PUSH_MERGED_DATA OOB for slot {} to server.", slot);
+        comms.notify(serverPeerName, msg);
+
+      } catch (Exception e) {
+        logger.error("dispatchPushMerged: Failed for slot {}", slot, e);
+        pendingPushes.remove(slot);
+        callback.onFailure(e);
+        releaseSlot(slot);
+      }
+    });
   }
 
   private void dispatchFetch(long streamId, int chunkIndex, ChunkReceivedCallback callback, int slot) {
@@ -274,15 +473,21 @@ public class CommsClient {
   }
 
   private void releaseSlot(int slot) {
-    FetchRequest nextReq = waitingQueue.poll();
-    if (nextReq != null) {
-      logger.info("releaseSlot: Reusing released slot offset {} for queued request {}_{}. Remaining in queue: {}", 
-          slot, nextReq.streamId, nextReq.chunkIndex, waitingQueue.size());
-      dispatchFetch(nextReq.streamId, nextReq.chunkIndex, nextReq.callback, slot);
+    if (slot < this.pushBoundary) {
+      pushFreeSlots.offer(slot);
+      logger.info("releaseSlot: Returned push slot offset {} to pool. Free push slots: {}", 
+          slot, pushFreeSlots.size());
     } else {
-      freeSlots.offer(slot);
-      logger.info("releaseSlot: Returned slot offset {} to pool. Free slots: {}, Queue size: {}", 
-          slot, freeSlots.size(), waitingQueue.size());
+      FetchRequest nextReq = waitingQueue.poll();
+      if (nextReq != null) {
+        logger.info("releaseSlot: Reusing released fetch slot offset {} for queued request {}_{}. Remaining in queue: {}", 
+            slot, nextReq.streamId, nextReq.chunkIndex, waitingQueue.size());
+        dispatchFetch(nextReq.streamId, nextReq.chunkIndex, nextReq.callback, slot);
+      } else {
+        fetchFreeSlots.offer(slot);
+        logger.info("releaseSlot: Returned fetch slot offset {} to pool. Free fetch slots: {}, Queue size: {}", 
+            slot, fetchFreeSlots.size(), waitingQueue.size());
+      }
     }
   }
 
@@ -344,6 +549,31 @@ public class CommsClient {
           } else {
             logger.warn("Received CHUNK_FAILED for unknown task: {}_{}", streamId, chunkIndex);
           }
+        } else if (msg.startsWith("PUSH_COMPLETE:")) {
+          // Format: PUSH_COMPLETE:slotOffset
+          String[] parts = msg.split(":");
+          int slotOffset = Integer.parseInt(parts[1]);
+          RpcResponseCallback callback = pendingPushes.remove(slotOffset);
+          if (callback != null) {
+            logger.info("pollNotifications: PUSH_COMPLETE received for slotOffset {}", slotOffset);
+            callback.onSuccess(ByteBuffer.wrap(new byte[] { 0 })); // SUCCESS status code (0)
+          } else {
+            logger.warn("pollNotifications: PUSH_COMPLETE received for unknown slotOffset {}", slotOffset);
+          }
+          releaseSlot(slotOffset);
+        } else if (msg.startsWith("PUSH_FAILED:")) {
+          // Format: PUSH_FAILED:slotOffset:errorMsg
+          String[] parts = msg.split(":");
+          int slotOffset = Integer.parseInt(parts[1]);
+          String errorMsg = parts[2];
+          RpcResponseCallback callback = pendingPushes.remove(slotOffset);
+          if (callback != null) {
+            logger.error("pollNotifications: PUSH_FAILED received for slotOffset {}: {}", slotOffset, errorMsg);
+            callback.onFailure(new IOException("RDMA push failed: " + errorMsg));
+          } else {
+            logger.warn("pollNotifications: PUSH_FAILED received for unknown slotOffset {}", slotOffset);
+          }
+          releaseSlot(slotOffset);
         }
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
@@ -358,7 +588,7 @@ public class CommsClient {
   }
 
   private void failPendingTasks(Throwable cause) {
-    logger.info("Failing all pending tasks. Count: {}", pendingTasks.size());
+    logger.info("Failing all pending tasks. Count: {}", pendingTasks.size() + pendingPushes.size());
     for (Map.Entry<String, FetchTask> entry : pendingTasks.entrySet()) {
       FetchTask task = entry.getValue();
       try {
@@ -369,6 +599,18 @@ public class CommsClient {
       releaseSlot(task.localOffset);
     }
     pendingTasks.clear();
+
+    for (Map.Entry<Integer, RpcResponseCallback> entry : pendingPushes.entrySet()) {
+      int slot = entry.getKey();
+      RpcResponseCallback callback = entry.getValue();
+      try {
+        callback.onFailure(cause);
+      } catch (Exception e) {
+        logger.error("Failed to trigger onFailure callback for push slot {}", slot, e);
+      }
+      releaseSlot(slot);
+    }
+    pendingPushes.clear();
   }
 
   /**
@@ -391,10 +633,16 @@ public class CommsClient {
       try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Read, localIov, remoteIov, "")) {
         CommsWrapper.TransferStatus status;
         long startTime = System.currentTimeMillis();
+        int spinCount = 0;
         do {
           status = req.getStatus();
           if (status.state == CommsWrapper.State.InProgress) {
-            Thread.yield();
+            if (spinCount < 100) {
+              Thread.onSpinWait();
+              spinCount++;
+            } else {
+              Thread.yield();
+            }
           }
         } while (status.state == CommsWrapper.State.InProgress && running.get());
 
@@ -409,12 +657,11 @@ public class CommsClient {
 
       // Slice the direct ByteBuffer for this slot
       ByteBuffer sliced;
-      synchronized (localBuffer) {
-        localBuffer.clear();
-        localBuffer.position(task.localOffset);
-        localBuffer.limit(task.localOffset + length);
-        sliced = localBuffer.slice();
-      }
+      // No synchronization needed!
+      ByteBuffer duplicate = localBuffer.duplicate();
+      duplicate.position(task.localOffset);
+      duplicate.limit(task.localOffset + length);
+      sliced = duplicate.slice();
 
       // Wrap it with our custom delegator to intercept release()
       ByteBuf customBuf = new CustomRDMAByteBuf(
@@ -526,22 +773,4 @@ public class CommsClient {
     }
   }
 
-  /**
-   * A custom Netty ByteBuf that delegates all operations to an underlying ByteBuf,
-   * but runs a release hook when the reference count drops to 0.
-   */
-  private static class CustomRDMAByteBuf extends io.netty.buffer.UnpooledDirectByteBuf {
-    private final Runnable releaseHook;
-
-    CustomRDMAByteBuf(io.netty.buffer.ByteBufAllocator alloc, java.nio.ByteBuffer buffer, int maxCapacity, Runnable releaseHook) {
-      super(alloc, buffer, maxCapacity);
-      this.releaseHook = releaseHook;
-    }
-
-    @Override
-    protected void deallocate() {
-      super.deallocate();
-      releaseHook.run();
-    }
-  }
 }

@@ -104,7 +104,11 @@ private[celeborn] class Worker(
       conf.rdmaBootstrapPort,
       if (conf.rdmaBufferSize > 0) conf.rdmaBufferSize.toInt else conf.shuffleChunkSize.toInt,
       conf.rdmaOobPort,
-      conf.rdmaTestJni
+      conf.rdmaTestJni,
+      conf.rdmaPushSlotsCount,
+      conf.rdmaFetchSlotsCount,
+      conf.rdmaPushSlotSize.toInt,
+      conf.rdmaFetchSlotSize.toInt
     )
     logInfo("Celeborn Worker: RDMA transport is enabled.")
     new Thread(new Runnable {
@@ -294,6 +298,39 @@ private[celeborn] class Worker(
           val len = nioBuf.remaining()
           target.put(nioBuf)
           len
+        }
+      })
+
+      logInfo("Registering ChunkPushHandler in rdmaServer...")
+      rdmaServer.registerChunkPushHandler(new rdma_comms.CommsServer.ChunkPushHandler {
+        override def pushData(
+            shuffleKey: String,
+            partitionUniqueId: String,
+            body: io.netty.buffer.ByteBuf,
+            callback: org.apache.celeborn.common.network.client.RpcResponseCallback): Unit = {
+          val fakePushData = new org.apache.celeborn.common.network.protocol.PushData(
+            0.toByte, // PRIMARY Mode
+            shuffleKey,
+            partitionUniqueId,
+            new org.apache.celeborn.common.network.buffer.NettyManagedBuffer(body)
+          )
+          pushDataHandler.handlePushData(fakePushData, callback)
+        }
+
+        override def pushMergedData(
+            shuffleKey: String,
+            partitionUniqueIds: Array[String],
+            offsets: Array[Int],
+            body: io.netty.buffer.ByteBuf,
+            callback: org.apache.celeborn.common.network.client.RpcResponseCallback): Unit = {
+          val fakePushMergedData = new org.apache.celeborn.common.network.protocol.PushMergedData(
+            0.toByte, // PRIMARY Mode
+            shuffleKey,
+            partitionUniqueIds,
+            offsets,
+            new org.apache.celeborn.common.network.buffer.NettyManagedBuffer(body)
+          )
+          pushDataHandler.handlePushMergedData(fakePushMergedData, callback)
         }
       })
     }

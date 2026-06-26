@@ -514,6 +514,10 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def rdmaRemoteIp: String = get(RDMA_REMOTE_IP)
   def rdmaBootstrapPort: Int = get(RDMA_BOOTSTRAP_PORT)
   def rdmaBufferSize: Long = get(RDMA_BUFFER_SIZE)
+  def rdmaPushSlotsCount: Int = get(RDMA_PUSH_SLOTS_COUNT)
+  def rdmaFetchSlotsCount: Int = get(RDMA_FETCH_SLOTS_COUNT)
+  def rdmaPushSlotSize: Long = get(RDMA_PUSH_SLOT_SIZE)
+  def rdmaFetchSlotSize: Long = get(RDMA_FETCH_SLOT_SIZE)
   def rdmaOobPort: Int = get(RDMA_OOB_PORT)
   def rdmaRemotePeerName: String = get(RDMA_REMOTE_PEER_NAME)
   def rdmaEnabled: Boolean = get(RDMA_ENABLED)
@@ -1958,6 +1962,38 @@ object CelebornConf extends Logging {
       .doc("JNI buffer size (in bytes). If 0, defaults to chunk size.")
       .longConf
       .createWithDefault(0L)
+
+  val RDMA_PUSH_SLOTS_COUNT: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.push.slots.count")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("Number of RDMA push slots per client.")
+      .intConf
+      .createWithDefault(32)
+
+  val RDMA_FETCH_SLOTS_COUNT: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.fetch.slots.count")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("Number of RDMA fetch slots per client.")
+      .intConf
+      .createWithDefault(8)
+
+  val RDMA_PUSH_SLOT_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.rdma.push.slot.size")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("RDMA push slot size.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("2m")
+
+  val RDMA_FETCH_SLOT_SIZE: ConfigEntry[Long] =
+    buildConf("celeborn.rdma.fetch.slot.size")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("RDMA fetch slot size. If 0, defaults to chunk size + 4MB.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("0")
 
   val RDMA_OOB_PORT: ConfigEntry[Int] =
     buildConf("celeborn.rdma.oobPort")
