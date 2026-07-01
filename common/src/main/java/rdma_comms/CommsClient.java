@@ -274,11 +274,11 @@ public class CommsClient {
 
     Integer slot = fetchFreeSlots.poll();
     if (slot != null) {
-      logger.info("fetchChunk: Acquired fetch slot offset {} for chunk {}_{} immediately. Free fetch slots: {}, Queue size: {}", 
+      logger.debug("fetchChunk: Acquired fetch slot offset {} for chunk {}_{} immediately. Free fetch slots: {}, Queue size: {}", 
           slot, streamId, chunkIndex, fetchFreeSlots.size(), waitingQueue.size());
       dispatchFetch(streamId, chunkIndex, callback, slot);
     } else {
-      logger.info("fetchChunk: No fetch slots available for chunk {}_{}. Queueing request. Free fetch slots: 0, Queue size: {}", 
+      logger.debug("fetchChunk: No fetch slots available for chunk {}_{}. Queueing request. Free fetch slots: 0, Queue size: {}", 
           streamId, chunkIndex, waitingQueue.size() + 1);
       waitingQueue.offer(new FetchRequest(streamId, chunkIndex, callback));
     }
@@ -302,7 +302,7 @@ public class CommsClient {
       return;
     }
 
-    logger.info("pushData: Acquired push slot offset {} for push to {} partition {}. Free push slots: {}, Queue size: {}", 
+    logger.debug("pushData: Acquired push slot offset {} for push to {} partition {}. Free push slots: {}, Queue size: {}", 
         slot, shuffleKey, partitionUniqueId, pushFreeSlots.size(), waitingQueue.size());
     dispatchPush(body, shuffleKey, partitionUniqueId, callback, slot);
   }
@@ -350,13 +350,13 @@ public class CommsClient {
             if (status.state != CommsWrapper.State.Done) {
               throw new IOException("RDMA Write failed with state: " + status.state + " after " + duration + "ms");
             }
-            logger.info("dispatchPush: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
+            logger.debug("dispatchPush: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
           }
         }
 
         // 4. Send OOB notification to server
         String msg = "PUSH_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionUniqueId;
-        logger.info("dispatchPush: Sending PUSH_DATA OOB for slot {} to server.", slot);
+        logger.debug("dispatchPush: Sending PUSH_DATA OOB for slot {} to server.", slot);
         comms.notify(serverPeerName, msg);
 
       } catch (Exception e) {
@@ -386,7 +386,7 @@ public class CommsClient {
       return;
     }
 
-    logger.info("pushMergedData: Acquired push slot offset {} for merged push to {}. Partitions: {}, Free push slots: {}, Queue size: {}", 
+    logger.debug("pushMergedData: Acquired push slot offset {} for merged push to {}. Partitions: {}, Free push slots: {}, Queue size: {}", 
         slot, shuffleKey, java.util.Arrays.toString(partitionUniqueIds), pushFreeSlots.size(), waitingQueue.size());
     dispatchPushMerged(body, shuffleKey, partitionUniqueIds, offsets, callback, slot);
   }
@@ -434,7 +434,7 @@ public class CommsClient {
             if (status.state != CommsWrapper.State.Done) {
               throw new IOException("RDMA Write (Merged) failed with state: " + status.state + " after " + duration + "ms");
             }
-            logger.info("dispatchPushMerged: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
+            logger.debug("dispatchPushMerged: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
           }
         }
 
@@ -446,7 +446,7 @@ public class CommsClient {
 
         // 5. Send PUSH_MERGED_DATA OOB notification to server
         String msg = "PUSH_MERGED_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionIdsStr + ";" + offsetsStr;
-        logger.info("dispatchPushMerged: Sending PUSH_MERGED_DATA OOB for slot {} to server.", slot);
+        logger.debug("dispatchPushMerged: Sending PUSH_MERGED_DATA OOB for slot {} to server.", slot);
         comms.notify(serverPeerName, msg);
 
       } catch (Exception e) {
@@ -467,7 +467,7 @@ public class CommsClient {
 
         // Send OOB notification to server to prepare the chunk
         String msg = "FETCH_CHUNK:" + streamId + ":" + chunkIndex;
-        logger.info("dispatchFetch: Sending FETCH_CHUNK OOB for {}_{} with slot offset {}. Pending tasks count: {}", 
+        logger.debug("dispatchFetch: Sending FETCH_CHUNK OOB for {}_{} with slot offset {}. Pending tasks count: {}", 
             streamId, chunkIndex, slot, pendingTasks.size());
         comms.notify(serverPeerName, msg);
       } catch (Exception e) {
@@ -481,17 +481,17 @@ public class CommsClient {
   private void releaseSlot(int slot) {
     if (slot < this.pushBoundary) {
       pushFreeSlots.offer(slot);
-      logger.info("releaseSlot: Returned push slot offset {} to pool. Free push slots: {}", 
+      logger.debug("releaseSlot: Returned push slot offset {} to pool. Free push slots: {}", 
           slot, pushFreeSlots.size());
     } else {
       FetchRequest nextReq = waitingQueue.poll();
       if (nextReq != null) {
-        logger.info("releaseSlot: Reusing released fetch slot offset {} for queued request {}_{}. Remaining in queue: {}", 
+        logger.debug("releaseSlot: Reusing released fetch slot offset {} for queued request {}_{}. Remaining in queue: {}", 
             slot, nextReq.streamId, nextReq.chunkIndex, waitingQueue.size());
         dispatchFetch(nextReq.streamId, nextReq.chunkIndex, nextReq.callback, slot);
       } else {
         fetchFreeSlots.offer(slot);
-        logger.info("releaseSlot: Returned fetch slot offset {} to pool. Free fetch slots: {}, Queue size: {}", 
+        logger.debug("releaseSlot: Returned fetch slot offset {} to pool. Free fetch slots: {}, Queue size: {}", 
             slot, fetchFreeSlots.size(), waitingQueue.size());
       }
     }
@@ -513,7 +513,7 @@ public class CommsClient {
         }
 
         String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
-        logger.info("Received OOB notification from server: {}", msg);
+        logger.debug("Received OOB notification from server: {}", msg);
 
         if (msg.startsWith("CHUNK_READY:")) {
           // Format: CHUNK_READY:streamId:chunkIndex:length:serverOffset
@@ -526,7 +526,7 @@ public class CommsClient {
           String key = streamId + "_" + chunkIndex;
           FetchTask task = pendingTasks.remove(key);
           if (task != null) {
-            logger.info("pollNotifications: Dispatched chunk {}_{} (len: {}, serverOffset: {}, localOffset: {}) to transfer thread.", 
+            logger.debug("pollNotifications: Dispatched chunk {}_{} (len: {}, serverOffset: {}, localOffset: {}) to transfer thread.", 
                 streamId, chunkIndex, length, serverOffset, task.localOffset);
             transferExecutor.submit(() -> executeRdmaRead(task, length, serverOffset));
           } else {
@@ -561,7 +561,7 @@ public class CommsClient {
           int slotOffset = Integer.parseInt(parts[1]);
           RpcResponseCallback callback = pendingPushes.remove(slotOffset);
           if (callback != null) {
-            logger.info("pollNotifications: PUSH_COMPLETE received for slotOffset {}", slotOffset);
+            logger.debug("pollNotifications: PUSH_COMPLETE received for slotOffset {}", slotOffset);
             callback.onSuccess(ByteBuffer.wrap(new byte[] { 0 })); // SUCCESS status code (0)
           } else {
             logger.warn("pollNotifications: PUSH_COMPLETE received for unknown slotOffset {}", slotOffset);
@@ -626,7 +626,7 @@ public class CommsClient {
     long localAddr = localBaseAddress + task.localOffset;
     long remoteAddr = remoteBaseAddress + serverOffset;
     
-    logger.info("executeRdmaRead: Starting JNI postTransfer (Read) for chunk {}_{} (len: {}, serverOffset: {}, localOffset: {})...", 
+    logger.debug("executeRdmaRead: Starting JNI postTransfer (Read) for chunk {}_{} (len: {}, serverOffset: {}, localOffset: {})...", 
         task.streamId, task.chunkIndex, length, serverOffset, task.localOffset);
 
     try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
@@ -656,10 +656,10 @@ public class CommsClient {
         if (status.state != CommsWrapper.State.Done) {
           throw new IOException("RDMA Read failed with state: " + status.state + " after " + duration + "ms");
         }
-        logger.info("executeRdmaRead: JNI transfer complete for chunk {}_{} in {}ms.", task.streamId, task.chunkIndex, duration);
+        logger.debug("executeRdmaRead: JNI transfer complete for chunk {}_{} in {}ms.", task.streamId, task.chunkIndex, duration);
       }
 
-      logger.info("executeRdmaRead: Completed processing for chunk {}_{}.", task.streamId, task.chunkIndex);
+      logger.debug("executeRdmaRead: Completed processing for chunk {}_{}.", task.streamId, task.chunkIndex);
 
       // Slice the direct ByteBuffer for this slot
       ByteBuffer sliced;
@@ -675,7 +675,7 @@ public class CommsClient {
           sliced,
           length,
           () -> {
-            logger.info("CustomRDMAByteBuf release hook: Triggered for slot offset {} for chunk {}_{}", 
+            logger.debug("CustomRDMAByteBuf release hook: Triggered for slot offset {} for chunk {}_{}", 
                 task.localOffset, task.streamId, task.chunkIndex);
             releaseSlot(task.localOffset);
             // Notify server that we are done with its slot

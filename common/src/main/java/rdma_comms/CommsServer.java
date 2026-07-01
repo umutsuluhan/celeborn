@@ -280,7 +280,7 @@ public class CommsServer {
         }
 
         String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
-        logger.info("Received OOB notification from client {}: {}", clientPeerName, msg);
+        logger.debug("Received OOB notification from client {}: {}", clientPeerName, msg);
 
         if (msg.startsWith("FETCH_CHUNK:")) {
           // Format: FETCH_CHUNK:streamId:chunkIndex
@@ -289,9 +289,9 @@ public class CommsServer {
           int chunkIndex = Integer.parseInt(parts[2]);
           String key = streamId + "_" + chunkIndex;
 
-          logger.info("pollClientNotifications: Queuing fetch request for {} from client {} in fetchExecutor.", key, clientPeerName);
+          logger.debug("pollClientNotifications: Queuing fetch request for {} from client {} in fetchExecutor.", key, clientPeerName);
           fetchExecutor.submit(() -> {
-            logger.info("handleFetchChunkRequest: Task started executing for {} from client {}", key, clientPeerName);
+            logger.debug("handleFetchChunkRequest: Task started executing for {} from client {}", key, clientPeerName);
             handleFetchChunkRequest(ctx, streamId, chunkIndex);
           });
 
@@ -301,7 +301,7 @@ public class CommsServer {
           int serverOffset = Integer.parseInt(parts[1]);
           
           ctx.freeSlots.offer(serverOffset); // Free the slot for reuse
-          logger.info("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
+          logger.debug("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
               clientPeerName, serverOffset, ctx.freeSlots.size());
         } else if (msg.startsWith("PUSH_DATA:")) {
           // Format: PUSH_DATA:slotOffset:length:shuffleKey:partitionUniqueId
@@ -311,9 +311,9 @@ public class CommsServer {
           String shuffleKey = parts[3];
           String partitionUniqueId = parts[4];
           
-          logger.info("pollClientNotifications: Queuing push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
+          logger.debug("pollClientNotifications: Queuing push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
           fetchExecutor.submit(() -> {
-            logger.info("handlePushDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+            logger.debug("handlePushDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
             handlePushDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueId);
           });
         } else if (msg.startsWith("PUSH_MERGED_DATA:")) {
@@ -330,9 +330,9 @@ public class CommsServer {
               .mapToInt(Integer::parseInt)
               .toArray();
           
-          logger.info("pollClientNotifications: Queuing merged push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
+          logger.debug("pollClientNotifications: Queuing merged push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
           fetchExecutor.submit(() -> {
-            logger.info("handlePushMergedDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+            logger.debug("handlePushMergedDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
             handlePushMergedDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueIds, offsets);
           });
         }
@@ -373,7 +373,7 @@ public class CommsServer {
       chunkPushHandler.pushData(shuffleKey, partitionUniqueId, body, new RpcResponseCallback() {
         @Override
         public void onSuccess(ByteBuffer response) {
-          logger.info("handlePushDataRequest: Push queued successfully for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
+          logger.debug("handlePushDataRequest: Push queued successfully for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
           if (completed.compareAndSet(false, true)) {
             String reply = "PUSH_COMPLETE:" + slotOffset;
             try {
@@ -431,7 +431,7 @@ public class CommsServer {
       chunkPushHandler.pushMergedData(shuffleKey, partitionUniqueIds, offsets, body, new RpcResponseCallback() {
         @Override
         public void onSuccess(ByteBuffer response) {
-          logger.info("handlePushMergedDataRequest: Push merged successfully processed for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
+          logger.debug("handlePushMergedDataRequest: Push merged successfully processed for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
           String reply = "PUSH_COMPLETE:" + slotOffset;
           try {
             comms.notify(ctx.peerName, reply);
@@ -475,14 +475,14 @@ public class CommsServer {
 
     int slotOffset = -1;
     try {
-      logger.info("handleFetchChunkRequest: Processing {}_{} for client {}. Free slots before borrow: {}", 
+      logger.debug("handleFetchChunkRequest: Processing {}_{} for client {}. Free slots before borrow: {}", 
           streamId, chunkIndex, ctx.peerName, ctx.freeSlots.size());
       
       long startTime = System.currentTimeMillis();
       slotOffset = ctx.freeSlots.take(); // Blocking wait if all slots are full
       long borrowTime = System.currentTimeMillis() - startTime;
       
-      logger.info("handleFetchChunkRequest: Borrowed slot offset {} for {}_{} in {}ms. Remaining free slots: {}", 
+      logger.debug("handleFetchChunkRequest: Borrowed slot offset {} for {}_{} in {}ms. Remaining free slots: {}", 
           slotOffset, streamId, chunkIndex, borrowTime, ctx.freeSlots.size());
 
       // Slice the client's buffer at the slot offset to write the chunk data
@@ -499,12 +499,12 @@ public class CommsServer {
       int length = chunkFetchHandler.fetchChunk(streamId, chunkIndex, target);
       long readDuration = System.currentTimeMillis() - readStartTime;
       
-      logger.info("handleFetchChunkRequest: Disk fetch complete for {}_{} (len: {}) in {}ms.", 
+      logger.debug("handleFetchChunkRequest: Disk fetch complete for {}_{} (len: {}) in {}ms.", 
           streamId, chunkIndex, length, readDuration);
 
       // Notify the client that the chunk is ready to be pulled via RDMA Read
       String reply = "CHUNK_READY:" + streamId + ":" + chunkIndex + ":" + length + ":" + slotOffset;
-      logger.info("handleFetchChunkRequest: Sending CHUNK_READY OOB reply to {} for {}_{} (serverOffset: {})", 
+      logger.debug("handleFetchChunkRequest: Sending CHUNK_READY OOB reply to {} for {}_{} (serverOffset: {})", 
           ctx.peerName, streamId, chunkIndex, slotOffset);
       comms.notify(ctx.peerName, reply);
 
