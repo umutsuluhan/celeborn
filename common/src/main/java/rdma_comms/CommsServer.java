@@ -76,7 +76,9 @@ public class CommsServer {
                      int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;
-    this.localIp = localIp;
+    this.localIp = (localIp == null || localIp.isEmpty())
+        ? org.apache.celeborn.common.util.JavaUtils.getLocalHost()
+        : localIp;
     this.bootstrapPort = bootstrapPort;
     this.oobPort = oobPort;
     this.testMode = testMode;

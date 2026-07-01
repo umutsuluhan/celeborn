@@ -39,6 +39,7 @@ public class CommsClient {
           CommsClient client = new CommsClient(
               conf.rdmaTransport(),
               uniqueClientName,
+              conf.rdmaLocalIp(),
               conf.rdmaRemoteIp(),
               conf.rdmaOobPort(),
               conf.rdmaRemotePeerName(),
@@ -60,6 +61,7 @@ public class CommsClient {
 
   private final String transportType;
   private final String localPeerName;
+  private final String localIp;
   private final String serverIp;
   private final int oobPort;
   private final String serverPeerName;
@@ -100,11 +102,14 @@ public class CommsClient {
    * @param oobPort Port of the remote OOB server.
    * @param serverPeerName Name of the remote server.
    */
-  public CommsClient(String transportType, String localPeerName, String serverIp, 
+  public CommsClient(String transportType, String localPeerName, String localIp, String serverIp, 
                 int oobPort, String serverPeerName, int slotSize,
                 int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;
+    this.localIp = (localIp == null || localIp.isEmpty())
+        ? org.apache.celeborn.common.util.JavaUtils.getLocalHost()
+        : localIp;
     this.serverIp = serverIp;
     this.oobPort = oobPort;
     this.serverPeerName = serverPeerName;
@@ -135,6 +140,7 @@ public class CommsClient {
       Map<String, String> params = new HashMap<>();
       params.put("AP_TRANSPORT", transport);
       params.put("AP_LOCAL_PEER_NAME", localPeerName);
+      params.put("AP_BOOTSTRAP_IP", localIp);
       params.put("AP_BOOTSTRAP_PORT", "0");
 
       comms.init(params);
