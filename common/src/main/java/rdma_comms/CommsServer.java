@@ -79,6 +79,9 @@ public class CommsServer {
     this.localIp = (localIp == null || localIp.isEmpty())
         ? org.apache.celeborn.common.util.JavaUtils.getLocalHost()
         : localIp;
+    this.localIp = (localIp == null || localIp.isEmpty())
+        ? org.apache.celeborn.common.util.JavaUtils.getLocalHost()
+        : localIp;
     this.bootstrapPort = bootstrapPort;
     this.oobPort = oobPort;
     this.testMode = testMode;
@@ -230,14 +233,22 @@ public class CommsServer {
         freeSlots.offer(pushBoundary + i * this.fetchSlotSize);
       }
 
-      // Start OOB notification poller thread for this client
+      // Start OOB notification poller thread and Ready Scheduler thread for this client
+      BlockingQueue<ReadyChunk> readyQueue = new LinkedBlockingQueue<>();
+      ClientContext ctx = new ClientContext(clientPeerName, clientBuffer, clientToken, freeSlots, readyQueue);
+      
       Thread poller = new Thread(() -> pollClientNotifications(clientPeerName), "RDMA-Server-Poller-" + clientPeerName);
       poller.setDaemon(true);
+      ctx.pollerThread = poller;
+
+      Thread readyScheduler = new Thread(() -> runReadyScheduler(ctx), "RDMA-Server-Ready-Scheduler-" + clientPeerName);
+      readyScheduler.setDaemon(true);
+      ctx.readySchedulerThread = readyScheduler;
       
-      ClientContext ctx = new ClientContext(clientPeerName, clientBuffer, clientToken, freeSlots, poller);
       clientContexts.put(clientPeerName, ctx);
       
       poller.start();
+      readyScheduler.start();
 
       // Send server handles and memory token back to the client
       byte[] serverHandleOpaque = comms.getEndpointInfo();
@@ -270,7 +281,7 @@ public class CommsServer {
       return;
     }
 
-    while (running.get()) {
+    while (running.get() && ctx.running.get()) {
       try {
         byte[] msgBytes = comms.getPeerNotification(clientPeerName);
         if (msgBytes == null) {
@@ -282,19 +293,27 @@ public class CommsServer {
         String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
         logger.debug("Received OOB notification from client {}: {}", clientPeerName, msg);
 
-        if (msg.startsWith("FETCH_CHUNK:")) {
-          // Format: FETCH_CHUNK:streamId:chunkIndex
-          String[] parts = msg.split(":");
-          long streamId = Long.parseLong(parts[1]);
-          int chunkIndex = Integer.parseInt(parts[2]);
-          String key = streamId + "_" + chunkIndex;
-
-          logger.debug("pollClientNotifications: Queuing fetch request for {} from client {} in fetchExecutor.", key, clientPeerName);
-          fetchExecutor.submit(() -> {
-            logger.debug("handleFetchChunkRequest: Task started executing for {} from client {}", key, clientPeerName);
-            handleFetchChunkRequest(ctx, streamId, chunkIndex);
-          });
-
+        if (msg.startsWith("BATCH_FETCH_CHUNK:")) {
+          // Format: BATCH_FETCH_CHUNK:streamId1,chunk1;streamId2,chunk2;...
+          String[] parts = msg.split(":", 2);
+          if (parts.length < 2 || parts[1].isEmpty()) {
+            logger.warn("pollClientNotifications: Received empty BATCH_FETCH_CHUNK from client {}", clientPeerName);
+            continue;
+          }
+          String payload = parts[1];
+          String[] items = payload.split(";");
+          logger.info("pollClientNotifications: Queuing batch fetch request of size {} from client {} in fetchExecutor.", items.length, clientPeerName);
+          
+          for (String item : items) {
+            String[] fields = item.split(",");
+            long streamId = Long.parseLong(fields[0]);
+            int chunkIndex = Integer.parseInt(fields[1]);
+            
+            fetchExecutor.submit(() -> {
+              logger.info("handleFetchChunkRequest (Batch): Task started executing for {}_{} from client {}", streamId, chunkIndex, clientPeerName);
+              handleFetchChunkRequest(ctx, streamId, chunkIndex);
+            });
+          }
         } else if (msg.startsWith("CHUNK_DONE:")) {
           // Format: CHUNK_DONE:serverOffset
           String[] parts = msg.split(":");
@@ -303,19 +322,29 @@ public class CommsServer {
           ctx.freeSlots.offer(serverOffset); // Free the slot for reuse
           logger.debug("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
               clientPeerName, serverOffset, ctx.freeSlots.size());
-        } else if (msg.startsWith("PUSH_DATA:")) {
-          // Format: PUSH_DATA:slotOffset:length:shuffleKey:partitionUniqueId
-          String[] parts = msg.split(":");
-          int slotOffset = Integer.parseInt(parts[1]);
-          int length = Integer.parseInt(parts[2]);
-          String shuffleKey = parts[3];
-          String partitionUniqueId = parts[4];
+        } else if (msg.startsWith("BATCH_PUSH_DATA:")) {
+          // Format: BATCH_PUSH_DATA:slot1,len1,shuffleKey1,part1;slot2,len2,shuffleKey2,part2;...
+          String[] parts = msg.split(":", 2);
+          if (parts.length < 2 || parts[1].isEmpty()) {
+            logger.warn("pollClientNotifications: Received empty BATCH_PUSH_DATA from client {}", clientPeerName);
+            continue;
+          }
+          String payload = parts[1];
+          String[] items = payload.split(";");
+          logger.info("pollClientNotifications: Queuing batch push request of size {} from client {} in fetchExecutor.", items.length, clientPeerName);
           
-          logger.debug("pollClientNotifications: Queuing push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
-          fetchExecutor.submit(() -> {
-            logger.debug("handlePushDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
-            handlePushDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueId);
-          });
+          for (String item : items) {
+            String[] fields = item.split(",");
+            int slotOffset = Integer.parseInt(fields[0]);
+            int length = Integer.parseInt(fields[1]);
+            String shuffleKey = fields[2];
+            String partitionUniqueId = fields[3];
+            
+            fetchExecutor.submit(() -> {
+              logger.info("handlePushDataRequest (Batch): Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+              handlePushDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueId);
+            });
+          }
         } else if (msg.startsWith("PUSH_MERGED_DATA:")) {
           // Format: PUSH_MERGED_DATA:slotOffset:length:shuffleKey:partitionIdsString;offsetsString
           String[] parts = msg.split(":", 5);
@@ -502,11 +531,10 @@ public class CommsServer {
       logger.debug("handleFetchChunkRequest: Disk fetch complete for {}_{} (len: {}) in {}ms.", 
           streamId, chunkIndex, length, readDuration);
 
-      // Notify the client that the chunk is ready to be pulled via RDMA Read
-      String reply = "CHUNK_READY:" + streamId + ":" + chunkIndex + ":" + length + ":" + slotOffset;
-      logger.debug("handleFetchChunkRequest: Sending CHUNK_READY OOB reply to {} for {}_{} (serverOffset: {})", 
-          ctx.peerName, streamId, chunkIndex, slotOffset);
-      comms.notify(ctx.peerName, reply);
+      // Queue the ready chunk for batched notification
+      ctx.readyQueue.offer(new ReadyChunk(streamId, chunkIndex, length, slotOffset));
+      logger.info("handleFetchChunkRequest: Queued ready chunk {}_{} (len: {}, serverOffset: {}) for client {}", 
+          streamId, chunkIndex, length, slotOffset, ctx.peerName);
 
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
@@ -557,10 +585,14 @@ public class CommsServer {
       }
     }
 
-    // Stop all client poller threads and deregister client memory
+    // Stop all client poller and scheduler threads, and deregister client memory
     for (ClientContext ctx : clientContexts.values()) {
+      ctx.running.set(false);
       if (ctx.pollerThread != null) {
         ctx.pollerThread.interrupt();
+      }
+      if (ctx.readySchedulerThread != null) {
+        ctx.readySchedulerThread.interrupt();
       }
       if (ctx.localToken != null) {
       try {
@@ -593,24 +625,73 @@ public class CommsServer {
     return clientPeerNames.get(clientIp);
   }
 
+  private void runReadyScheduler(ClientContext ctx) {
+    logger.info("RDMA Server Ready Scheduler thread started for client: {}", ctx.peerName);
+    while (running.get() && ctx.running.get()) {
+      try {
+        java.util.List<ReadyChunk> batch = new java.util.ArrayList<>();
+        ReadyChunk first = ctx.readyQueue.take();
+        batch.add(first);
+        ctx.readyQueue.drainTo(batch);
+        
+        if (!batch.isEmpty()) {
+          StringBuilder sb = new StringBuilder("BATCH_CHUNK_READY:");
+          for (int i = 0; i < batch.size(); i++) {
+            if (i > 0) sb.append(";");
+            ReadyChunk rc = batch.get(i);
+            sb.append(rc.streamId).append(",")
+              .append(rc.chunkIndex).append(",")
+              .append(rc.length).append(",")
+              .append(rc.slotOffset);
+          }
+          comms.notify(ctx.peerName, sb.toString());
+          logger.info("runReadyScheduler: Sent BATCH_CHUNK_READY of size {} to {}", batch.size(), ctx.peerName);
+        }
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      } catch (Exception e) {
+        logger.error("Error in Ready Scheduler for client {}", ctx.peerName, e);
+      }
+    }
+    logger.info("RDMA Server Ready Scheduler thread stopped for client: {}", ctx.peerName);
+  }
+
   // -------------------------------------------------------------------------
   // Helper Classes
   // -------------------------------------------------------------------------
+
+  private static class ReadyChunk {
+    final long streamId;
+    final int chunkIndex;
+    final int length;
+    final int slotOffset;
+
+    ReadyChunk(long streamId, int chunkIndex, int length, int slotOffset) {
+      this.streamId = streamId;
+      this.chunkIndex = chunkIndex;
+      this.length = length;
+      this.slotOffset = slotOffset;
+    }
+  }
 
   private static class ClientContext {
     final String peerName;
     final ByteBuffer localBuffer;
     final CommsWrapper.MemToken localToken;
     final BlockingQueue<Integer> freeSlots;
-    final Thread pollerThread;
+    Thread pollerThread;
+    Thread readySchedulerThread;
+    final BlockingQueue<ReadyChunk> readyQueue;
+    final java.util.concurrent.atomic.AtomicBoolean running = new java.util.concurrent.atomic.AtomicBoolean(true);
 
     ClientContext(String peerName, ByteBuffer localBuffer, CommsWrapper.MemToken localToken, 
-                  BlockingQueue<Integer> freeSlots, Thread pollerThread) {
+                  BlockingQueue<Integer> freeSlots, BlockingQueue<ReadyChunk> readyQueue) {
       this.peerName = peerName;
       this.localBuffer = localBuffer;
       this.localToken = localToken;
       this.freeSlots = freeSlots;
-      this.pollerThread = pollerThread;
+      this.readyQueue = readyQueue;
     }
   }
 }

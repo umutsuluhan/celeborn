@@ -522,6 +522,10 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def rdmaRemotePeerName: String = get(RDMA_REMOTE_PEER_NAME)
   def rdmaEnabled: Boolean = get(RDMA_ENABLED)
   def rdmaTestJni: Boolean = get(RDMA_TEST_JNI)
+  def rdmaWriteBatchSize: Int = get(RDMA_WRITE_BATCH_SIZE)
+  def rdmaWriteBatchLingerMs: Long = get(RDMA_WRITE_BATCH_LINGER_MS)
+  def rdmaReadBatchSize: Int = get(RDMA_READ_BATCH_SIZE)
+  def rdmaReadBatchLingerMs: Long = get(RDMA_READ_BATCH_LINGER_MS)
 
   def bindPreferIP: Boolean = get(NETWORK_BIND_PREFER_IP)
   def advertisePreferIP: Boolean = get(NETWORK_ADVERTISE_PREFER_IP)
@@ -2026,6 +2030,38 @@ object CelebornConf extends Logging {
       .doc("Whether to trigger JNI Data Plane Read verification test during startup.")
       .booleanConf
       .createWithDefault(false)
+
+  val RDMA_WRITE_BATCH_SIZE: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.write.batch.size")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("Target batch size for RDMA writes.")
+      .intConf
+      .createWithDefault(8)
+
+  val RDMA_WRITE_BATCH_LINGER_MS: ConfigEntry[Long] =
+    buildConf("celeborn.rdma.write.batch.lingerMs")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("Linger time in milliseconds for RDMA write batching.")
+      .longConf
+      .createWithDefault(1L)
+
+  val RDMA_READ_BATCH_SIZE: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.read.batch.size")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("Target batch size for RDMA reads.")
+      .intConf
+      .createWithDefault(4)
+
+  val RDMA_READ_BATCH_LINGER_MS: ConfigEntry[Long] =
+    buildConf("celeborn.rdma.read.batch.lingerMs")
+      .categories("client")
+      .version("0.6.3-rdma")
+      .doc("Linger time in milliseconds for RDMA read batching.")
+      .longConf
+      .createWithDefault(1L)
 
   val NETWORK_MEMORY_ALLOCATOR_ALLOW_CACHE: ConfigEntry[Boolean] =
     buildConf("celeborn.network.memory.allocator.allowCache")
