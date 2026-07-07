@@ -156,16 +156,8 @@ public class CommsServer {
               String clientIp = clientSock.getInetAddress().getHostAddress();
               logger.info("OOB Client connected from {}", clientSock.getRemoteSocketAddress());
 
-              // Handle client registration in a separate thread to avoid blocking accept loop
-              registerExecutor.submit(() -> {
-                String oldName = Thread.currentThread().getName();
-                Thread.currentThread().setName("RDMA-Server-Register-" + clientIp);
-                try {
-                  handleClientRegistration(clientSock, clientIp);
-                } finally {
-                  Thread.currentThread().setName(oldName);
-                }
-              });
+              // Handle client registration sequentially to avoid connection storms and interleaving race conditions
+              handleClientRegistration(clientSock, clientIp);
 
             } catch (IOException e) {
               if (running.get() && !listenSock.isClosed()) {
@@ -260,6 +252,10 @@ public class CommsServer {
       out.write(serverTokenOpaque);
       out.flush();
       logger.info("Shared handles and {}MB pool token sent to client: {}", this.poolSize / (1024 * 1024), clientPeerName);
+
+      logger.info("Waiting for client JNI connection confirmation for {}...", clientPeerName);
+      in.readByte();
+      logger.info("Client JNI connection confirmed for: {}", clientPeerName);
 
     } catch (Exception e) {
       logger.error("Failed to register client from IP {}", clientIp, e);

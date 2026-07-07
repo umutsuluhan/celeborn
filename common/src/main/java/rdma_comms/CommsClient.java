@@ -245,7 +245,9 @@ public class CommsClient {
         // 3. Connect to server transport layer
         comms.addRemoteEndpoint(serverPeerName, serverHandleOpaque, true);
         comms.connect(serverPeerName);
-        logger.info("Added remote endpoint and connected.");
+        logger.info("Added remote endpoint and connected. Confirming connection to OOB server...");
+        out.writeByte(1);
+        out.flush();
 
         // 4. Allocate local buffer and register it (same size as server's buffer)
         this.localBuffer = ByteBuffer.allocateDirect((int) remoteSize);
