@@ -2,6 +2,7 @@ package rdma_comms;
 
 import java.nio.ByteBuffer;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 
 /**
  * Main entry point for the communication library.
@@ -26,6 +27,7 @@ public class CommsWrapper implements AutoCloseable {
 
   // Holds the raw pointer to the C++ comms::Comms object.
   private final long nativePtr;
+  private final Semaphore transferSemaphore = new Semaphore(128);
 
   /**
    * Constructor. Creates the underlying C++ Comms object.
@@ -104,14 +106,31 @@ public class CommsWrapper implements AutoCloseable {
    * Posts an asynchronous transfer operation.
    * Equivalent to 'absl::StatusOr<unique_ptr<Request>> comms::Comms::PostTransfer(...)'.
    */
-  public synchronized Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
+  public Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
+    long tAcq = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      transferSemaphore.acquire();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new CommsException("Interrupted while waiting for transfer semaphore: " + e.getMessage());
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.SEMAPHORE_ACQUIRE, System.nanoTime() - tAcq);
+      }
+    }
+
+    boolean success = false;
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
       long reqPtr = nativePostTransfer(nativePtr, remotePeer, op.ordinal(), local.getNativePtr(), remote.getNativePtr(), notificationMessage);
-      return new Request(reqPtr);
+      success = true;
+      return new Request(reqPtr, transferSemaphore);
     } finally {
       if (RDMA_TRACKER_ENABLED) {
         RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
+      }
+      if (!success) {
+        transferSemaphore.release();
       }
     }
   }
@@ -136,7 +155,7 @@ public class CommsWrapper implements AutoCloseable {
    * Internally extracts the message from 'NotificationProto' in C++ JNI layer.
    * Returns null if no notification is pending.
    */
-  public synchronized byte[] getPeerNotification(String remotePeer) {
+  public byte[] getPeerNotification(String remotePeer) {
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
       return nativeGetPeerNotification(nativePtr, remotePeer);
@@ -228,23 +247,43 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   public static class Request implements AutoCloseable {
+    private static final State[] CACHED_STATES = State.values();
+    private final long[] scratchStats = new long[1];
     private long nativePtr;
-    Request(long nativePtr) { this.nativePtr = nativePtr; }
+    private final Semaphore semaphore;
+
+    Request(long nativePtr, Semaphore semaphore) { 
+      this.nativePtr = nativePtr; 
+      this.semaphore = semaphore;
+    }
     long getNativePtr() { return nativePtr; }
 
-    public TransferStatus getStatus() {
+    public boolean isInProgress() {
       if (nativePtr == 0) throw new IllegalStateException("Closed");
-      long[] stats = new long[1];
       long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
       try {
-        int state = nativeRequestGetStatus(nativePtr, stats);
-        return new TransferStatus(State.values()[state], stats[0]);
+        int state = nativeRequestGetStatus(nativePtr, scratchStats);
+        return CACHED_STATES[state] == State.InProgress;
       } finally {
         if (RDMA_TRACKER_ENABLED) {
           RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
         }
       }
     }
+
+    public TransferStatus getStatus() {
+      if (nativePtr == 0) throw new IllegalStateException("Closed");
+      long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+      try {
+        int state = nativeRequestGetStatus(nativePtr, scratchStats);
+        return new TransferStatus(CACHED_STATES[state], scratchStats[0]);
+      } finally {
+        if (RDMA_TRACKER_ENABLED) {
+          RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
+        }
+      }
+    }
+
     @Override
     public void close() {
       if (nativePtr != 0) {
@@ -257,6 +296,9 @@ public class CommsWrapper implements AutoCloseable {
           }
         }
         nativePtr = 0;
+        if (semaphore != null) {
+          semaphore.release();
+        }
       }
     }
   }
