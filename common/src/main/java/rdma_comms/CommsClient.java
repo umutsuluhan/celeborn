@@ -423,17 +423,15 @@ public class CommsClient {
             CommsWrapper.TransferStatus status;
             long startTime = System.currentTimeMillis();
             int spinCount = 0;
-            do {
-              status = req.getStatus();
-              if (status.state == CommsWrapper.State.InProgress) {
-                if (spinCount < 100) {
-                  Thread.onSpinWait();
-                  spinCount++;
-                } else {
-                  Thread.yield();
-                }
+            while (req.isInProgress() && running.get()) {
+              if (spinCount < 10) {
+                Thread.onSpinWait();
+                spinCount++;
+              } else {
+                java.util.concurrent.locks.LockSupport.parkNanos(25_000);
               }
-            } while (status.state == CommsWrapper.State.InProgress && running.get());
+            }
+            status = req.getStatus();
 
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
@@ -519,17 +517,15 @@ public class CommsClient {
             CommsWrapper.TransferStatus status;
             long startTime = System.currentTimeMillis();
             int spinCount = 0;
-            do {
-              status = req.getStatus();
-              if (status.state == CommsWrapper.State.InProgress) {
-                if (spinCount < 100) {
-                  Thread.onSpinWait();
-                  spinCount++;
-                } else {
-                  Thread.yield();
-                }
+            while (req.isInProgress() && running.get()) {
+              if (spinCount < 10) {
+                Thread.onSpinWait();
+                spinCount++;
+              } else {
+                java.util.concurrent.locks.LockSupport.parkNanos(25_000);
               }
-            } while (status.state == CommsWrapper.State.InProgress && running.get());
+            }
+            status = req.getStatus();
 
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
@@ -680,17 +676,15 @@ public class CommsClient {
             CommsWrapper.TransferStatus status;
             long startTime = System.currentTimeMillis();
             int spinCount = 0;
-            do {
-              status = req.getStatus();
-              if (status.state == CommsWrapper.State.InProgress) {
-                if (spinCount < 100) {
-                  Thread.onSpinWait();
-                  spinCount++;
-                } else {
-                  Thread.yield();
-                }
+            while (req.isInProgress() && running.get()) {
+              if (spinCount < 10) {
+                Thread.onSpinWait();
+                spinCount++;
+              } else {
+                java.util.concurrent.locks.LockSupport.parkNanos(25_000);
               }
-            } while (status.state == CommsWrapper.State.InProgress && running.get());
+            }
+            status = req.getStatus();
 
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
@@ -917,17 +911,15 @@ public class CommsClient {
         CommsWrapper.TransferStatus status;
         long startTime = System.currentTimeMillis();
         int spinCount = 0;
-        do {
-          status = req.getStatus();
-          if (status.state == CommsWrapper.State.InProgress) {
-            if (spinCount < 100) {
-              Thread.onSpinWait();
-              spinCount++;
-            } else {
-              Thread.yield();
-            }
+        while (req.isInProgress() && running.get()) {
+          if (spinCount < 10) {
+            Thread.onSpinWait();
+            spinCount++;
+          } else {
+            java.util.concurrent.locks.LockSupport.parkNanos(25_000);
           }
-        } while (status.state == CommsWrapper.State.InProgress && running.get());
+        }
+        status = req.getStatus();
 
         long duration = System.currentTimeMillis() - startTime;
         if (status.state != CommsWrapper.State.Done) {
