@@ -279,7 +279,10 @@ public class CommsServer {
         byte[] msgBytes = comms.getPeerNotification(clientPeerName);
         if (msgBytes == null) {
           // getPeerNotification is non-blocking, sleep to avoid busy spin
-          Thread.sleep(5);
+          java.util.concurrent.locks.LockSupport.parkNanos(500_000); // 500 us
+          if (Thread.currentThread().isInterrupted()) {
+            break;
+          }
           continue;
         }
 
@@ -365,9 +368,7 @@ public class CommsServer {
           });
         }
 
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        break;
+
       } catch (Throwable t) {
         logger.error("FATAL: Error in poller thread for client {}", clientPeerName, t);
         break;

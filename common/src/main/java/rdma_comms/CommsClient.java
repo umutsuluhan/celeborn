@@ -770,7 +770,10 @@ public class CommsClient {
         if (msgBytes == null) {
           // getPeerNotification is non-blocking in current JNI if no notifications,
           // so sleep briefly to prevent busy waiting.
-          Thread.sleep(5);
+          java.util.concurrent.locks.LockSupport.parkNanos(500_000); // 500 us
+          if (Thread.currentThread().isInterrupted()) {
+            break;
+          }
           continue;
         }
 
@@ -852,9 +855,7 @@ public class CommsClient {
           }
           releaseSlot(slotOffset);
         }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        break;
+
       } catch (Throwable t) {
         logger.error("FATAL: Error in OOB poller thread", t);
         break;
