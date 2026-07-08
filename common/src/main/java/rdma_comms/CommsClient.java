@@ -53,6 +53,7 @@ public class CommsClient {
               conf.rdmaReadBatchSize(),
               conf.rdmaReadBatchLingerMs()
           );
+          client.rdmaTrackerEnabled = conf.rdmaTrackerEnabled();
           client.setup();
           _instance = client;
           logger.info("EAGER BOOT GATING: JNI CommsClient setup successful and registered!");
@@ -62,6 +63,7 @@ public class CommsClient {
     return _instance;
   }
   private static final Logger logger = LoggerFactory.getLogger(CommsClient.class);
+  private boolean rdmaTrackerEnabled = true;
 
   private final String transportType;
   private final String localPeerName;
@@ -167,6 +169,7 @@ public class CommsClient {
       params.put("AP_LOCAL_PEER_NAME", localPeerName);
       params.put("AP_BOOTSTRAP_IP", localIp);
       params.put("AP_BOOTSTRAP_PORT", "0");
+      params.put("AP_RDMA_TRACKER_ENABLED", String.valueOf(rdmaTrackerEnabled));
 
       comms.init(params);
       logger.info("Comms library initialized.");
@@ -389,6 +392,9 @@ public class CommsClient {
   }
 
   private void dispatchBatch(java.util.List<PushRequest> batch) {
+    if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+      RDMATracker.recordBatchSize(RDMATracker.BatchType.CLIENT_PUSH, batch.size());
+    }
     transferExecutor.submit(() -> {
       try {
         // 1. Copy all bodies into localBuffer at their respective slots
@@ -655,6 +661,9 @@ public class CommsClient {
   }
 
   private void dispatchBatchRead(java.util.List<FetchTask> batch) {
+    if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+      RDMATracker.recordBatchSize(RDMATracker.BatchType.CLIENT_FETCH, batch.size());
+    }
     transferExecutor.submit(() -> {
       try {
         try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);

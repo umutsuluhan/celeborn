@@ -22,6 +22,8 @@ public class CommsWrapper implements AutoCloseable {
     }
   }
 
+  public static volatile boolean RDMA_TRACKER_ENABLED = true;
+
   // Holds the raw pointer to the C++ comms::Comms object.
   private final long nativePtr;
 
@@ -34,6 +36,9 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   public synchronized void init(Map<String, String> params) {
+    if (params.containsKey("AP_RDMA_TRACKER_ENABLED")) {
+      RDMA_TRACKER_ENABLED = Boolean.parseBoolean(params.get("AP_RDMA_TRACKER_ENABLED"));
+    }
     nativeInit(nativePtr, params);
   }
 
@@ -100,8 +105,15 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::StatusOr<unique_ptr<Request>> comms::Comms::PostTransfer(...)'.
    */
   public synchronized Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
-    long reqPtr = nativePostTransfer(nativePtr, remotePeer, op.ordinal(), local.getNativePtr(), remote.getNativePtr(), notificationMessage);
-    return new Request(reqPtr);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      long reqPtr = nativePostTransfer(nativePtr, remotePeer, op.ordinal(), local.getNativePtr(), remote.getNativePtr(), notificationMessage);
+      return new Request(reqPtr);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -109,7 +121,14 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::Status comms::Comms::Notify(const std::string&, const std::string&)'.
    */
   public synchronized void notify(String remotePeer, String message) {
-    nativeNotify(nativePtr, remotePeer, message);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      nativeNotify(nativePtr, remotePeer, message);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.NOTIFY, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -118,7 +137,14 @@ public class CommsWrapper implements AutoCloseable {
    * Returns null if no notification is pending.
    */
   public synchronized byte[] getPeerNotification(String remotePeer) {
-    return nativeGetPeerNotification(nativePtr, remotePeer);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      return nativeGetPeerNotification(nativePtr, remotePeer);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.GET_PEER_NOTIFICATION, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -209,13 +235,27 @@ public class CommsWrapper implements AutoCloseable {
     public TransferStatus getStatus() {
       if (nativePtr == 0) throw new IllegalStateException("Closed");
       long[] stats = new long[1];
-      int state = nativeRequestGetStatus(nativePtr, stats);
-      return new TransferStatus(State.values()[state], stats[0]);
+      long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+      try {
+        int state = nativeRequestGetStatus(nativePtr, stats);
+        return new TransferStatus(State.values()[state], stats[0]);
+      } finally {
+        if (RDMA_TRACKER_ENABLED) {
+          RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
+        }
+      }
     }
     @Override
     public void close() {
       if (nativePtr != 0) {
-        nativeRequestDestroy(nativePtr);
+        long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+        try {
+          nativeRequestDestroy(nativePtr);
+        } finally {
+          if (RDMA_TRACKER_ENABLED) {
+            RDMATracker.record(RDMATracker.CallType.REQUEST_DESTROY, System.nanoTime() - t0);
+          }
+        }
         nativePtr = 0;
       }
     }

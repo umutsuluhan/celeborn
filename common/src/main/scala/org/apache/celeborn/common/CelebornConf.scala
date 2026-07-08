@@ -521,6 +521,7 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def rdmaOobPort: Int = get(RDMA_OOB_PORT)
   def rdmaRemotePeerName: String = get(RDMA_REMOTE_PEER_NAME)
   def rdmaEnabled: Boolean = get(RDMA_ENABLED)
+  def rdmaTrackerEnabled: Boolean = get(RDMA_TRACKER_ENABLED)
   def rdmaTestJni: Boolean = get(RDMA_TEST_JNI)
   def rdmaWriteBatchSize: Int = get(RDMA_WRITE_BATCH_SIZE)
   def rdmaWriteBatchLingerMs: Long = get(RDMA_WRITE_BATCH_LINGER_MS)
@@ -2022,6 +2023,14 @@ object CelebornConf extends Logging {
       .doc("Whether to enable RDMA communication and data path components.")
       .booleanConf
       .createWithDefault(false)
+
+  val RDMA_TRACKER_ENABLED: ConfigEntry[Boolean] =
+    buildConf("celeborn.rdma.tracker.enabled")
+      .categories("common")
+      .version("0.6.3-rdma")
+      .doc("Whether to enable RDMA latency tracking for the communication library.")
+      .booleanConf
+      .createWithDefault(true)
 
   val RDMA_TEST_JNI: ConfigEntry[Boolean] =
     buildConf("celeborn.rdma.test_jni")

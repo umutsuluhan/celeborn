@@ -295,6 +295,9 @@ public class CommsServer {
           }
           String payload = parts[1];
           String[] items = payload.split(";");
+          if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+            RDMATracker.recordBatchSize(RDMATracker.BatchType.SERVER_FETCH_REQUEST, items.length);
+          }
           logger.info("pollClientNotifications: Queuing batch fetch request of size {} from client {} in fetchExecutor.", items.length, clientPeerName);
           
           for (String item : items) {
@@ -324,6 +327,9 @@ public class CommsServer {
           }
           String payload = parts[1];
           String[] items = payload.split(";");
+          if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+            RDMATracker.recordBatchSize(RDMATracker.BatchType.SERVER_PUSH_REQUEST, items.length);
+          }
           logger.info("pollClientNotifications: Queuing batch push request of size {} from client {} in fetchExecutor.", items.length, clientPeerName);
           
           for (String item : items) {
@@ -628,6 +634,9 @@ public class CommsServer {
         ctx.readyQueue.drainTo(batch);
         
         if (!batch.isEmpty()) {
+          if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+            RDMATracker.recordBatchSize(RDMATracker.BatchType.SERVER_CHUNK_READY, batch.size());
+          }
           StringBuilder sb = new StringBuilder("BATCH_CHUNK_READY:");
           for (int i = 0; i < batch.size(); i++) {
             if (i > 0) sb.append(";");
