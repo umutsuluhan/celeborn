@@ -13,6 +13,13 @@ public class RDMATracker {
   private static final Logger logger = LoggerFactory.getLogger(RDMATracker.class);
 
   public enum CallType {
+    INIT,
+    GET_ENDPOINT_INFO,
+    ADD_REMOTE_ENDPOINT,
+    CONNECT,
+    REG_MEM,
+    DEREG_MEM,
+    GET_MEM_TOKEN,
     SEMAPHORE_ACQUIRE,
     POST_TRANSFER,
     NOTIFY,

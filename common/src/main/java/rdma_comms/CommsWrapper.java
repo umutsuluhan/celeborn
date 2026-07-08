@@ -38,10 +38,17 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   public synchronized void init(Map<String, String> params) {
-    if (params.containsKey("AP_RDMA_TRACKER_ENABLED")) {
-      RDMA_TRACKER_ENABLED = Boolean.parseBoolean(params.get("AP_RDMA_TRACKER_ENABLED"));
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      if (params.containsKey("AP_RDMA_TRACKER_ENABLED")) {
+        RDMA_TRACKER_ENABLED = Boolean.parseBoolean(params.get("AP_RDMA_TRACKER_ENABLED"));
+      }
+      nativeInit(nativePtr, params);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.INIT, System.nanoTime() - t0);
+      }
     }
-    nativeInit(nativePtr, params);
   }
 
   /**
@@ -49,7 +56,14 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::StatusOr<size_t> comms::Comms::GetEndpointInfo(opaque_data_t& data)'.
    */
   public synchronized byte[] getEndpointInfo() {
-    return nativeGetEndpointInfo(nativePtr);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      return nativeGetEndpointInfo(nativePtr);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.GET_ENDPOINT_INFO, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -61,7 +75,14 @@ public class CommsWrapper implements AutoCloseable {
    * @param block If true, blocks until the connection is established.
    */
   public synchronized void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
-    nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.ADD_REMOTE_ENDPOINT, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -69,7 +90,14 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::Status comms::Comms::Connect(const std::string&)'.
    */
   public synchronized void connect(String peerName) {
-    nativeConnect(nativePtr, peerName);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      nativeConnect(nativePtr, peerName);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.CONNECT, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -80,8 +108,15 @@ public class CommsWrapper implements AutoCloseable {
     if (!buffer.isDirect()) {
       throw new IllegalArgumentException("Buffer must be direct");
     }
-    long tokenPtr = nativeRegMem(nativePtr, buffer, size, type.ordinal());
-    return new MemToken(tokenPtr);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      long tokenPtr = nativeRegMem(nativePtr, buffer, size, type.ordinal());
+      return new MemToken(tokenPtr);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.REG_MEM, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -89,8 +124,15 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::Status comms::Comms::DeregMem(MemToken&)'
    */
   public synchronized void deregMem(MemToken token) {
-    nativeDeregMem(nativePtr, token.getNativePtr());
-    token.close(); 
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      nativeDeregMem(nativePtr, token.getNativePtr());
+      token.close(); 
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.DEREG_MEM, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
@@ -98,8 +140,15 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::StatusOr<unique_ptr<MemToken>> comms::Comms::GetMemToken(const opaque_data_t&)'.
    */
   public synchronized MemToken getMemToken(byte[] serTok) {
-    long tokenPtr = nativeGetMemToken(nativePtr, serTok);
-    return new MemToken(tokenPtr);
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      long tokenPtr = nativeGetMemToken(nativePtr, serTok);
+      return new MemToken(tokenPtr);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.GET_MEM_TOKEN, System.nanoTime() - t0);
+      }
+    }
   }
 
   /**
