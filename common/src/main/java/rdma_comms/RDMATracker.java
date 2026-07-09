@@ -62,6 +62,28 @@ public class RDMATracker {
   private static final java.util.concurrent.ConcurrentHashMap<Integer, LongAdder> serverPushReqBatchSizes = new java.util.concurrent.ConcurrentHashMap<>();
   private static final java.util.concurrent.ConcurrentHashMap<Integer, LongAdder> serverChunkReadyBatchSizes = new java.util.concurrent.ConcurrentHashMap<>();
 
+  private static class SizeStatBucket {
+    final LongAdder count = new LongAdder();
+    final LongAdder totalBytes = new LongAdder();
+    final AtomicLong maxBytes = new AtomicLong(0);
+
+    void record(long bytes) {
+      count.increment();
+      totalBytes.add(bytes);
+      
+      long currentMax;
+      do {
+        currentMax = maxBytes.get();
+        if (bytes <= currentMax) {
+          break;
+        }
+      } while (!maxBytes.compareAndSet(currentMax, bytes));
+    }
+  }
+
+  private static final SizeStatBucket readTransfers = new SizeStatBucket();
+  private static final SizeStatBucket writeTransfers = new SizeStatBucket();
+
   static {
     int numTypes = CallType.values().length;
     buckets = new StatBucket[numTypes];
@@ -92,6 +114,14 @@ public class RDMATracker {
     }
     if (map != null) {
       map.computeIfAbsent(size, k -> new LongAdder()).increment();
+    }
+  }
+
+  public static void recordTransfer(boolean isRead, long bytes) {
+    if (isRead) {
+      readTransfers.record(bytes);
+    } else {
+      writeTransfers.record(bytes);
     }
   }
 
@@ -127,6 +157,16 @@ public class RDMATracker {
 
       writer.println();
       writer.println("=====================================================================================");
+      writer.println("RDMA Data Transfer Statistics Snapshot");
+      writer.println("=====================================================================================");
+      writer.printf("%-15s %12s %18s %18s %18s%n", "Transfer Type", "Count", "Total Data (MB)", "Avg Size (KB)", "Max Size (KB)");
+      writer.println("-------------------------------------------------------------------------------------");
+      printTransferStats(writer, "READ", readTransfers);
+      printTransferStats(writer, "WRITE", writeTransfers);
+      writer.println("=====================================================================================");
+
+      writer.println();
+      writer.println("=====================================================================================");
       writer.println("RDMA Batch Size Distributions");
       writer.println("=====================================================================================");
       printBatchSizes(writer, "CLIENT PUSH Batch Sizes", clientPushBatchSizes);
@@ -150,6 +190,18 @@ public class RDMATracker {
       map.entrySet().stream()
           .sorted(java.util.Map.Entry.comparingByKey())
           .forEach(entry -> writer.printf("  Size %3d: %d times%n", entry.getKey(), entry.getValue().sum()));
+    }
+  }
+
+  private static void printTransferStats(PrintWriter writer, String label, SizeStatBucket bucket) {
+    long count = bucket.count.sum();
+    if (count > 0) {
+      double totalMB = bucket.totalBytes.sum() / (1024.0 * 1024.0);
+      double avgKB = (bucket.totalBytes.sum() / (double) count) / 1024.0;
+      double maxKB = bucket.maxBytes.get() / 1024.0;
+      writer.printf("%-15s %12d %18.3f %18.3f %18.3f%n", label, count, totalMB, avgKB, maxKB);
+    } else {
+      writer.printf("%-15s %12d %18.3f %18.3f %18.3f%n", label, 0, 0.0, 0.0, 0.0);
     }
   }
 }

@@ -437,6 +437,13 @@ public class CommsClient {
             if (status.state != CommsWrapper.State.Done) {
               throw new IOException("RDMA Batch Write failed with state: " + status.state + " after " + duration + "ms");
             }
+            if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+              long totalBytes = 0;
+              for (PushRequest r : batch) {
+                totalBytes += r.body.length;
+              }
+              RDMATracker.recordTransfer(false, totalBytes);
+            }
             logger.debug("dispatchBatch: RDMA Write complete for batch of size {} in {}ms.", batch.size(), duration);
           }
         }
@@ -530,6 +537,9 @@ public class CommsClient {
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
               throw new IOException("RDMA Write (Merged) failed with state: " + status.state + " after " + duration + "ms");
+            }
+            if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+              RDMATracker.recordTransfer(false, length);
             }
             logger.debug("dispatchPushMerged: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
           }
@@ -689,6 +699,13 @@ public class CommsClient {
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
               throw new java.io.IOException("RDMA Batch Read failed with state: " + status.state + " after " + duration + "ms");
+            }
+            if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+              long totalBytes = 0;
+              for (FetchTask task : batch) {
+                totalBytes += task.length;
+              }
+              RDMATracker.recordTransfer(true, totalBytes);
             }
             logger.info("dispatchBatchRead: RDMA Read complete for batch of size {} in {}ms.", batch.size(), duration);
           }
@@ -925,6 +942,9 @@ public class CommsClient {
         long duration = System.currentTimeMillis() - startTime;
         if (status.state != CommsWrapper.State.Done) {
           throw new IOException("RDMA Read failed with state: " + status.state + " after " + duration + "ms");
+        }
+        if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+          RDMATracker.recordTransfer(true, length);
         }
         logger.debug("executeRdmaRead: JNI transfer complete for chunk {}_{} in {}ms.", task.streamId, task.chunkIndex, duration);
       }
