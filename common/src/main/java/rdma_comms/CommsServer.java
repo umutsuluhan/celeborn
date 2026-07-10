@@ -404,7 +404,11 @@ public class CommsServer {
         public void onSuccess(ByteBuffer response) {
           logger.debug("handlePushDataRequest: Push queued successfully for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
           if (completed.compareAndSet(false, true)) {
-            String reply = "PUSH_COMPLETE:" + slotOffset;
+            byte statusCode = 0;
+            if (response != null && response.remaining() > 0) {
+              statusCode = response.get(response.position());
+            }
+            String reply = "PUSH_COMPLETE:" + slotOffset + ":" + statusCode;
             try {
               comms.notify(ctx.peerName, reply);
             } catch (Exception ne) {
@@ -461,7 +465,11 @@ public class CommsServer {
         @Override
         public void onSuccess(ByteBuffer response) {
           logger.debug("handlePushMergedDataRequest: Push merged successfully processed for slot {} from client {}. Sending PUSH_COMPLETE immediately.", slotOffset, ctx.peerName);
-          String reply = "PUSH_COMPLETE:" + slotOffset;
+          byte statusCode = 0;
+          if (response != null && response.remaining() > 0) {
+            statusCode = response.get(response.position());
+          }
+          String reply = "PUSH_COMPLETE:" + slotOffset + ":" + statusCode;
           try {
             comms.notify(ctx.peerName, reply);
           } catch (Exception ne) {

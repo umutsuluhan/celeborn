@@ -847,13 +847,17 @@ public class CommsClient {
             logger.warn("Received CHUNK_FAILED for unknown task: {}_{}", streamId, chunkIndex);
           }
         } else if (msg.startsWith("PUSH_COMPLETE:")) {
-          // Format: PUSH_COMPLETE:slotOffset
+          // Format: PUSH_COMPLETE:slotOffset:statusCode
           String[] parts = msg.split(":");
           int slotOffset = Integer.parseInt(parts[1]);
+          byte statusCode = 0;
+          if (parts.length > 2) {
+            statusCode = Byte.parseByte(parts[2]);
+          }
           RpcResponseCallback callback = pendingPushes.remove(slotOffset);
           if (callback != null) {
-            logger.debug("pollNotifications: PUSH_COMPLETE received for slotOffset {}", slotOffset);
-            callback.onSuccess(ByteBuffer.wrap(new byte[] { 0 })); // SUCCESS status code (0)
+            logger.debug("pollNotifications: PUSH_COMPLETE received for slotOffset {} with status {}", slotOffset, statusCode);
+            callback.onSuccess(ByteBuffer.wrap(new byte[] { statusCode }));
           } else {
             logger.warn("pollNotifications: PUSH_COMPLETE received for unknown slotOffset {}", slotOffset);
           }
