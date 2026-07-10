@@ -425,10 +425,10 @@ public class CommsServer {
       // 4. CRITICAL: Release our initial reference now that the handler has retained it!
       body.release();
 
-    } catch (Exception e) {
-      logger.error("handlePushDataRequest: Error processing push for slot {} from client {}", slotOffset, ctx.peerName, e);
+    } catch (Throwable t) {
+      logger.error("handlePushDataRequest: Error processing push for slot {} from client {}", slotOffset, ctx.peerName, t);
       if (completed.compareAndSet(false, true)) {
-        sendPushFailed(ctx, slotOffset, e.getMessage());
+        sendPushFailed(ctx, slotOffset, t.getMessage());
       }
       if (body != null && body.refCnt() > 0) {
         body.release();
@@ -476,9 +476,15 @@ public class CommsServer {
         }
       });
 
-    } catch (Exception e) {
-      logger.error("handlePushMergedDataRequest: Error processing push for slot {} from client {}", slotOffset, ctx.peerName, e);
-      sendPushFailed(ctx, slotOffset, e.getMessage());
+      // Release our initial reference now that the handler has retained it!
+      body.release();
+
+    } catch (Throwable t) {
+      logger.error("handlePushMergedDataRequest: Error processing push for slot {} from client {}", slotOffset, ctx.peerName, t);
+      sendPushFailed(ctx, slotOffset, t.getMessage());
+      if (body != null && body.refCnt() > 0) {
+        body.release();
+      }
     }
   }
 
