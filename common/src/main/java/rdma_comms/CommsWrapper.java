@@ -74,7 +74,7 @@ public class CommsWrapper implements AutoCloseable {
    * @param opaqueHandleBytes Handle bytes received from the remote peer.
    * @param block If true, blocks until the connection is established.
    */
-  public synchronized void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
+  public void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
       nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
@@ -89,7 +89,7 @@ public class CommsWrapper implements AutoCloseable {
    * Explicitly connects to a remote peer.
    * Equivalent to 'absl::Status comms::Comms::Connect(const std::string&)'.
    */
-  public synchronized void connect(String peerName) {
+  public void connect(String peerName) {
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
       nativeConnect(nativePtr, peerName);
@@ -188,7 +188,7 @@ public class CommsWrapper implements AutoCloseable {
    * Sends a standalone notification message.
    * Equivalent to 'absl::Status comms::Comms::Notify(const std::string&, const std::string&)'.
    */
-  public synchronized void notify(String remotePeer, String message) {
+  public void notify(String remotePeer, String message) {
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
       nativeNotify(nativePtr, remotePeer, message);
