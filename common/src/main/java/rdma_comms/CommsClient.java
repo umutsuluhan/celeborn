@@ -156,6 +156,8 @@ public class CommsClient {
    * 5. Initializes Slot Pool and background threads.
    */
   public void setup() {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     String transport = "0";
     if ("RDMA".equalsIgnoreCase(transportType)) {
       transport = "1";
@@ -274,7 +276,7 @@ public class CommsClient {
             this.pushSlotsCount, this.pushSlotSize / 1024, this.fetchSlotsCount, this.fetchSlotSize / (1024 * 1024), this.pushBoundary / (1024 * 1024));
 
         // 6. Start Poller and Executor
-        this.transferExecutor = Executors.newFixedThreadPool(8, r -> {
+        this.transferExecutor = Executors.newFixedThreadPool(32, r -> {
           Thread t = new Thread(r, "RDMA-Client-Transfer-Thread");
           t.setDaemon(true);
           return t;
@@ -303,12 +305,19 @@ public class CommsClient {
       logger.error("Control setup failed", e);
       shutdown();
     }
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_SETUP, System.nanoTime() - t0_tracker);
+      }
+    }
   }
 
   /**
    * Asynchronously fetches a chunk via RDMA.
    */
   public void fetchChunk(long streamId, int chunkIndex, ChunkReceivedCallback callback) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     if (!running.get()) {
       callback.onFailure(chunkIndex, new IllegalStateException("CommsClient is not running"));
       return;
@@ -323,6 +332,11 @@ public class CommsClient {
       logger.debug("fetchChunk: No fetch slots available for chunk {}_{}. Queueing request. Free fetch slots: 0, Queue size: {}", 
           streamId, chunkIndex, waitingQueue.size() + 1);
       waitingQueue.offer(new FetchRequest(streamId, chunkIndex, callback));
+    }
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_FETCH_CHUNK, System.nanoTime() - t0_tracker);
+      }
     }
   }
 
@@ -420,18 +434,8 @@ public class CommsClient {
 
           // 3. Post SINGLE RDMA Write for the whole batch
           try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
-            CommsWrapper.TransferStatus status;
             long startTime = System.currentTimeMillis();
-            int spinCount = 0;
-            while (req.isInProgress() && running.get()) {
-              if (spinCount < 10) {
-                Thread.onSpinWait();
-                spinCount++;
-              } else {
-                java.util.concurrent.locks.LockSupport.parkNanos(25_000);
-              }
-            }
-            status = req.getStatus();
+            CommsWrapper.TransferStatus status = req.waitCompletion();
 
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
@@ -478,6 +482,8 @@ public class CommsClient {
    * Asynchronously pushes merged data via RDMA.
    */
   public void pushMergedData(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     if (!running.get()) {
       callback.onFailure(new IllegalStateException("CommsClient is not running"));
       return;
@@ -495,9 +501,16 @@ public class CommsClient {
     logger.debug("pushMergedData: Acquired push slot offset {} for merged push to {}. Partitions: {}, Free push slots: {}, Queue size: {}", 
         slot, shuffleKey, java.util.Arrays.toString(partitionUniqueIds), pushFreeSlots.size(), waitingQueue.size());
     dispatchPushMerged(body, shuffleKey, partitionUniqueIds, offsets, callback, slot);
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0_tracker);
+      }
+    }
   }
 
   private void dispatchPushMerged(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback, int slot) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     transferExecutor.submit(() -> {
       try {
         // 1. Copy body bytes into localBuffer at slot offset
@@ -521,18 +534,8 @@ public class CommsClient {
 
           // Post RDMA Write
           try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
-            CommsWrapper.TransferStatus status;
             long startTime = System.currentTimeMillis();
-            int spinCount = 0;
-            while (req.isInProgress() && running.get()) {
-              if (spinCount < 10) {
-                Thread.onSpinWait();
-                spinCount++;
-              } else {
-                java.util.concurrent.locks.LockSupport.parkNanos(25_000);
-              }
-            }
-            status = req.getStatus();
+            CommsWrapper.TransferStatus status = req.waitCompletion();
 
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
@@ -563,6 +566,11 @@ public class CommsClient {
         releaseSlot(slot);
       }
     });
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0_tracker);
+      }
+    }
   }
 
   private void dispatchFetch(long streamId, int chunkIndex, ChunkReceivedCallback callback, int slot) {
@@ -667,6 +675,8 @@ public class CommsClient {
   }
 
   private void dispatchBatchRead(java.util.List<FetchTask> batch) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     if (CommsWrapper.RDMA_TRACKER_ENABLED) {
       RDMATracker.recordBatchSize(RDMATracker.BatchType.CLIENT_FETCH, batch.size());
     }
@@ -683,18 +693,8 @@ public class CommsClient {
           }
           
           try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Read, localIov, remoteIov, "")) {
-            CommsWrapper.TransferStatus status;
             long startTime = System.currentTimeMillis();
-            int spinCount = 0;
-            while (req.isInProgress() && running.get()) {
-              if (spinCount < 10) {
-                Thread.onSpinWait();
-                spinCount++;
-              } else {
-                java.util.concurrent.locks.LockSupport.parkNanos(25_000);
-              }
-            }
-            status = req.getStatus();
+            CommsWrapper.TransferStatus status = req.waitCompletion();
 
             long duration = System.currentTimeMillis() - startTime;
             if (status.state != CommsWrapper.State.Done) {
@@ -755,6 +755,11 @@ public class CommsClient {
         }
       }
     });
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_BATCH_READ, System.nanoTime() - t0_tracker);
+      }
+    }
   }
 
   private void releaseSlot(int slot) {

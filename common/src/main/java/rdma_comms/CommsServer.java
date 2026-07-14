@@ -44,6 +44,7 @@ public class CommsServer {
   private final Map<String, String> clientPeerNames = new ConcurrentHashMap<>();
   private final Map<String, ClientContext> clientContexts = new ConcurrentHashMap<>();
   private final AtomicBoolean running = new AtomicBoolean(false);
+  public boolean rdmaTrackerEnabled = true;
 
   // Callback interface for fetching chunks from Celeborn Worker
   public interface ChunkFetchHandler {
@@ -114,6 +115,8 @@ public class CommsServer {
    * 3. For each client, allocates and registers a dedicated memory pool.
    */
   public void setup() {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     String transport = "0"; 
     if ("RDMA".equalsIgnoreCase(transportType)) {
       transport = "1";
@@ -138,7 +141,8 @@ public class CommsServer {
         return t;
       });
 
-      this.registerExecutor = java.util.concurrent.Executors.newCachedThreadPool(r -> {
+      int threadCount = Math.max(1, Runtime.getRuntime().availableProcessors() / 4);
+      this.registerExecutor = java.util.concurrent.Executors.newFixedThreadPool(threadCount, r -> {
         Thread t = new Thread(r, "RDMA-Server-Register");
         t.setDaemon(true);
         return t;
@@ -156,8 +160,8 @@ public class CommsServer {
               String clientIp = clientSock.getInetAddress().getHostAddress();
               logger.info("OOB Client connected from {}", clientSock.getRemoteSocketAddress());
 
-              // Handle client registration sequentially to avoid connection storms and interleaving race conditions
-              handleClientRegistration(clientSock, clientIp);
+              // Handle client registration in a bounded pool to allow parallel memory allocations while preventing RDMA JNI storms
+              registerExecutor.submit(() -> handleClientRegistration(clientSock, clientIp));
 
             } catch (IOException e) {
               if (running.get() && !listenSock.isClosed()) {
@@ -174,6 +178,11 @@ public class CommsServer {
       logger.error("Comms initialization failed", e);
       shutdown();
     }
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_SETUP, System.nanoTime() - t0_tracker);
+      }
+    }
   }
 
   /**
@@ -181,6 +190,8 @@ public class CommsServer {
    * and starts the client OOB poller thread.
    */
   private void handleClientRegistration(Socket clientSock, String clientIp) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     try (DataInputStream in = new DataInputStream(clientSock.getInputStream());
       DataOutputStream out = new DataOutputStream(clientSock.getOutputStream())) {
       
@@ -260,6 +271,11 @@ public class CommsServer {
     } catch (Exception e) {
       logger.error("Failed to register client from IP {}", clientIp, e);
       try { clientSock.close(); } catch (IOException ignored) {}
+    }
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_HANDLE_CLIENT_REGISTRATION, System.nanoTime() - t0_tracker);
+      }
     }
   }
 
@@ -441,6 +457,8 @@ public class CommsServer {
   }
 
   private void handlePushMergedDataRequest(ClientContext ctx, int slotOffset, int length, String shuffleKey, String[] partitionUniqueIds, int[] offsets) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     if (chunkPushHandler == null) {
       logger.error("handlePushMergedDataRequest: Cannot process PUSH_MERGED_DATA, ChunkPushHandler is not registered!");
       sendPushFailed(ctx, slotOffset, "ChunkPushHandler not registered");
@@ -494,6 +512,11 @@ public class CommsServer {
         body.release();
       }
     }
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_PUSH_MERGED_DATA_REQ, System.nanoTime() - t0_tracker);
+      }
+    }
   }
 
   private void sendPushFailed(ClientContext ctx, int slotOffset, String errorMsg) {
@@ -511,6 +534,8 @@ public class CommsServer {
    * and notifying the client.
    */
   private void handleFetchChunkRequest(ClientContext ctx, long streamId, int chunkIndex) {
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
     if (chunkFetchHandler == null) {
       logger.error("handleFetchChunkRequest: Cannot process FETCH_CHUNK, ChunkFetchHandler is not registered!");
       return;
@@ -574,6 +599,11 @@ public class CommsServer {
         comms.notify(ctx.peerName, reply);
       } catch (Exception ne) {
         logger.error("Failed to send CHUNK_FAILED reply to {}", ctx.peerName, ne);
+      }
+    }
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_FETCH_CHUNK_REQ, System.nanoTime() - t0_tracker);
       }
     }
   }

@@ -110,6 +110,7 @@ private[celeborn] class Worker(
       conf.rdmaPushSlotSize.toInt,
       conf.rdmaFetchSlotSize.toInt
     )
+    server.rdmaTrackerEnabled = conf.rdmaTrackerEnabled
     logInfo("Celeborn Worker: RDMA transport is enabled.")
     new Thread(new Runnable {
       override def run(): Unit = {

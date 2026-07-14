@@ -333,6 +333,20 @@ public class CommsWrapper implements AutoCloseable {
       }
     }
 
+    public TransferStatus waitCompletion() {
+      if (nativePtr == 0) throw new IllegalStateException("Closed");
+      long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+      try {
+        int state = nativeRequestWait(nativePtr, scratchStats);
+        return new TransferStatus(CACHED_STATES[state], scratchStats[0]);
+      } finally {
+        if (RDMA_TRACKER_ENABLED) {
+          // Re-use REQUEST_GET_STATUS tracker since we are waiting for status
+          RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
+        }
+      }
+    }
+
     @Override
     public void close() {
       if (nativePtr != 0) {
@@ -379,6 +393,7 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeTransferIovAddSegment(long iovPtr, long addr, long size, long tokenPtr);
 
   private static native int nativeRequestGetStatus(long reqPtr, long[] stats);
+  private static native int nativeRequestWait(long reqPtr, long[] stats);
   private static native void nativeRequestDestroy(long reqPtr);
 
   private static java.io.File createTempDir() throws java.io.IOException {
