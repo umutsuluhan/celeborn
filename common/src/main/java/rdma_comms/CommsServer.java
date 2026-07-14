@@ -338,30 +338,51 @@ public class CommsServer {
           logger.debug("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
               clientPeerName, serverOffset, ctx.freeSlots.size());
         } else if (msg.startsWith("BATCH_PUSH_DATA:")) {
-          // Format: BATCH_PUSH_DATA:slot1,len1,shuffleKey1,part1;slot2,len2,shuffleKey2,part2;...
+          // Format: BATCH_PUSH_DATA:M,slot,len,shuffleKey,part1,part2;off1,off2|S,slot,len,shuffleKey,part1|...
           String[] parts = msg.split(":", 2);
           if (parts.length < 2 || parts[1].isEmpty()) {
             logger.warn("pollClientNotifications: Received empty BATCH_PUSH_DATA from client {}", clientPeerName);
             continue;
           }
           String payload = parts[1];
-          String[] items = payload.split(";");
+          String[] items = payload.split("\\|");
           if (CommsWrapper.RDMA_TRACKER_ENABLED) {
             RDMATracker.recordBatchSize(RDMATracker.BatchType.SERVER_PUSH_REQUEST, items.length);
           }
           logger.info("pollClientNotifications: Queuing batch push request of size {} from client {} in fetchExecutor.", items.length, clientPeerName);
           
           for (String item : items) {
-            String[] fields = item.split(",");
-            int slotOffset = Integer.parseInt(fields[0]);
-            int length = Integer.parseInt(fields[1]);
-            String shuffleKey = fields[2];
-            String partitionUniqueId = fields[3];
-            
-            fetchExecutor.submit(() -> {
-              logger.info("handlePushDataRequest (Batch): Task started executing for slot {} from client {}", slotOffset, clientPeerName);
-              handlePushDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueId);
-            });
+            if (item.startsWith("S,")) {
+              String[] fields = item.substring(2).split(",");
+              int slotOffset = Integer.parseInt(fields[0]);
+              int length = Integer.parseInt(fields[1]);
+              String shuffleKey = fields[2];
+              String partitionUniqueId = fields[3];
+              
+              fetchExecutor.submit(() -> {
+                logger.debug("handlePushDataRequest (Batch): Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+                handlePushDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueId);
+              });
+            } else if (item.startsWith("M,")) {
+              String[] subParts = item.substring(2).split(";");
+              String[] fields = subParts[0].split(",");
+              
+              int slotOffset = Integer.parseInt(fields[0]);
+              int length = Integer.parseInt(fields[1]);
+              String shuffleKey = fields[2];
+              
+              String[] partitionUniqueIds = new String[fields.length - 3];
+              System.arraycopy(fields, 3, partitionUniqueIds, 0, fields.length - 3);
+              
+              int[] offsets = java.util.Arrays.stream(subParts[1].split(","))
+                  .mapToInt(Integer::parseInt)
+                  .toArray();
+                  
+              fetchExecutor.submit(() -> {
+                logger.debug("handlePushMergedDataRequest (Batch): Task started executing for slot {} from client {}", slotOffset, clientPeerName);
+                handlePushMergedDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueIds, offsets);
+              });
+            }
           }
         } else if (msg.startsWith("PUSH_MERGED_DATA:")) {
           // Format: PUSH_MERGED_DATA:slotOffset:length:shuffleKey:partitionIdsString;offsetsString

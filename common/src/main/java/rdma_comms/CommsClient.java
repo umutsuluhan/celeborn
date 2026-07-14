@@ -455,12 +455,15 @@ public class CommsClient {
         // 4. Send ONE OOB notification for the whole batch
         StringBuilder sb = new StringBuilder("BATCH_PUSH_DATA:");
         for (int i = 0; i < batch.size(); i++) {
-          if (i > 0) sb.append(";");
+          if (i > 0) sb.append("|");
           PushRequest req = batch.get(i);
-          sb.append(req.slot).append(",")
-            .append(req.body.length).append(",")
-            .append(req.shuffleKey).append(",")
-            .append(req.partitionUniqueId);
+          if (req.isMerged) {
+            String pIds = String.join(",", req.partitionUniqueIds);
+            String offs = java.util.Arrays.stream(req.offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+            sb.append("M,").append(req.slot).append(",").append(req.body.length).append(",").append(req.shuffleKey).append(",").append(pIds).append(";").append(offs);
+          } else {
+            sb.append("S,").append(req.slot).append(",").append(req.body.length).append(",").append(req.shuffleKey).append(",").append(req.partitionUniqueId);
+          }
         }
         String msg = sb.toString();
         logger.info("dispatchBatch: Sending BATCH_PUSH_DATA OOB for batch of size {} to server.", batch.size());
@@ -500,72 +503,7 @@ public class CommsClient {
 
     logger.debug("pushMergedData: Acquired push slot offset {} for merged push to {}. Partitions: {}, Free push slots: {}, Queue size: {}", 
         slot, shuffleKey, java.util.Arrays.toString(partitionUniqueIds), pushFreeSlots.size(), waitingQueue.size());
-    dispatchPushMerged(body, shuffleKey, partitionUniqueIds, offsets, callback, slot);
-    } finally {
-      if (rdmaTrackerEnabled) {
-        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0_tracker);
-      }
-    }
-  }
-
-  private void dispatchPushMerged(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback, int slot) {
-    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
-    try {
-    transferExecutor.submit(() -> {
-      try {
-        // 1. Copy body bytes into localBuffer at slot offset
-        ByteBuffer duplicate = localBuffer.duplicate();
-        duplicate.position(slot);
-        duplicate.put(body);
-
-        // 2. Register callback
-        pendingPushes.put(slot, callback);
-
-        // 3. Post RDMA Write
-        long localAddr = localBaseAddress + slot;
-        long remoteAddr = remoteBaseAddress + slot;
-        int length = body.length;
-
-        try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
-             CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
-          
-          localIov.addSegment(localAddr, length, localToken);
-          remoteIov.addSegment(remoteAddr, length, remoteToken);
-
-          // Post RDMA Write
-          try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
-            long startTime = System.currentTimeMillis();
-            CommsWrapper.TransferStatus status = req.waitCompletion();
-
-            long duration = System.currentTimeMillis() - startTime;
-            if (status.state != CommsWrapper.State.Done) {
-              throw new IOException("RDMA Write (Merged) failed with state: " + status.state + " after " + duration + "ms");
-            }
-            if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-              RDMATracker.recordTransfer(false, length);
-            }
-            logger.debug("dispatchPushMerged: RDMA Write complete for slot {} (len: {}) in {}ms.", slot, length, duration);
-          }
-        }
-
-        // 4. Serialize partition IDs and offsets arrays
-        String partitionIdsStr = String.join(",", partitionUniqueIds);
-        String offsetsStr = java.util.Arrays.stream(offsets)
-            .mapToObj(String::valueOf)
-            .collect(java.util.stream.Collectors.joining(","));
-
-        // 5. Send PUSH_MERGED_DATA OOB notification to server
-        String msg = "PUSH_MERGED_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionIdsStr + ";" + offsetsStr;
-        logger.debug("dispatchPushMerged: Sending PUSH_MERGED_DATA OOB for slot {} to server.", slot);
-        comms.notify(serverPeerName, msg);
-
-      } catch (Exception e) {
-        logger.error("dispatchPushMerged: Failed for slot {}", slot, e);
-        pendingPushes.remove(slot);
-        callback.onFailure(e);
-        releaseSlot(slot);
-      }
-    });
+    pushQueue.offer(new PushRequest(body, shuffleKey, partitionUniqueIds, offsets, callback, slot));
     } finally {
       if (rdmaTrackerEnabled) {
         rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0_tracker);
@@ -1123,14 +1061,35 @@ public class CommsClient {
   private static class PushRequest {
     final byte[] body;
     final String shuffleKey;
-    final String partitionUniqueId;
     final RpcResponseCallback callback;
     final int slot;
+    
+    // For single push
+    final String partitionUniqueId;
+    
+    // For merged push
+    final String[] partitionUniqueIds;
+    final int[] offsets;
+    final boolean isMerged;
 
     PushRequest(byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback, int slot) {
       this.body = body;
       this.shuffleKey = shuffleKey;
       this.partitionUniqueId = partitionUniqueId;
+      this.partitionUniqueIds = null;
+      this.offsets = null;
+      this.isMerged = false;
+      this.callback = callback;
+      this.slot = slot;
+    }
+
+    PushRequest(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback, int slot) {
+      this.body = body;
+      this.shuffleKey = shuffleKey;
+      this.partitionUniqueId = null;
+      this.partitionUniqueIds = partitionUniqueIds;
+      this.offsets = offsets;
+      this.isMerged = true;
       this.callback = callback;
       this.slot = slot;
     }
