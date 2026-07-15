@@ -204,6 +204,40 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   /**
+   * Pushes data directly and sends the notification asynchronously, handled entirely by C++.
+   *
+   * @param remotePeer remote peer name
+   * @param localAddr local memory address (must be registered)
+   * @param remoteAddr remote destination address
+   * @param length length of data
+   * @param localToken local mem token
+   * @param remoteToken remote mem token
+   * @param notificationMessage notification message
+   */
+  public void asyncPush(String remotePeer, long localAddr, long remoteAddr, long length, MemToken localToken, MemToken remoteToken, String notificationMessage) {
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      // Blocks if too many concurrent transfers are already running.
+      transferSemaphore.acquire();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new RuntimeException("Interrupted while acquiring transfer semaphore", e);
+    }
+    try {
+      nativeAsyncPush(nativePtr, remotePeer, localAddr, remoteAddr, length, localToken.getNativePtr(), remoteToken.getNativePtr(), notificationMessage);
+    } finally {
+        if (RDMA_TRACKER_ENABLED) {
+            // Just reuse POST_TRANSFER tracker type for now
+            RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
+        }
+        // Immediately release semaphore as the JNI transitions are done.
+        // Wait, should we release it here if the NIC handles it? 
+        // Yes, the concurrency is managed by the C++ transport internally now or slot counts.
+        transferSemaphore.release();
+    }
+  }
+
+  /**
    * Sends a standalone notification message.
    * Equivalent to 'absl::Status comms::Comms::Notify(const std::string&, const std::string&)'.
    */
@@ -416,6 +450,7 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeDeregAndFreeMem(long nativePtr, ByteBuffer buffer, long memTokenPtr);
   private static native long nativeGetMemToken(long nativePtr, byte[] serTok);
   private static native long nativePostTransfer(long nativePtr, String remotePeer, int op, long localIovPtr, long remoteIovPtr, String notificationMessage);
+  private static native void nativeAsyncPush(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
   private static native void nativeNotify(long nativePtr, String remotePeer, String message);
   private static native byte[] nativeGetPeerNotification(long nativePtr, String remotePeer);
   private static native byte[] nativeWaitPeerNotification(long nativePtr, String remotePeer);

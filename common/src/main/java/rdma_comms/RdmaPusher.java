@@ -52,25 +52,8 @@ public class RdmaPusher {
           long remoteAddr = client.getRemoteBaseAddress() + slot;
           int length = body.length;
 
-          try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
-               CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
-            
-            localIov.addSegment(localAddr, length, client.getLocalToken());
-            remoteIov.addSegment(remoteAddr, length, client.getRemoteToken());
-
-            try (CommsWrapper.Request req = client.getComms().postTransfer(client.getServerPeerName(), CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
-              CommsWrapper.TransferStatus status = req.waitCompletion();
-              if (status.state != CommsWrapper.State.Done) {
-                throw new java.io.IOException("RDMA Write failed with state: " + status.state);
-              }
-              if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-                rdma_comms.RDMATracker.recordTransfer(false, length);
-              }
-            }
-          }
-
           String msg = "PUSH_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionUniqueId;
-          client.getComms().notify(client.getServerPeerName(), msg);
+          client.getComms().asyncPush(client.getServerPeerName(), localAddr, remoteAddr, length, client.getLocalToken(), client.getRemoteToken(), msg);
 
         } catch (Exception e) {
           logger.error("dispatchPushData: Failed for slot {}", slot, e);
@@ -117,27 +100,10 @@ public class RdmaPusher {
           long remoteAddr = client.getRemoteBaseAddress() + slot;
           int length = body.length;
 
-          try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
-               CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
-            
-            localIov.addSegment(localAddr, length, client.getLocalToken());
-            remoteIov.addSegment(remoteAddr, length, client.getRemoteToken());
-
-            try (CommsWrapper.Request req = client.getComms().postTransfer(client.getServerPeerName(), CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
-              CommsWrapper.TransferStatus status = req.waitCompletion();
-              if (status.state != CommsWrapper.State.Done) {
-                throw new java.io.IOException("RDMA Merged Write failed with state: " + status.state);
-              }
-              if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-                rdma_comms.RDMATracker.recordTransfer(false, length);
-              }
-            }
-          }
-
           String pIds = String.join(",", partitionUniqueIds);
           String offs = java.util.Arrays.stream(offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
           String msg = "PUSH_MERGED_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + pIds + ";" + offs;
-          client.getComms().notify(client.getServerPeerName(), msg);
+          client.getComms().asyncPush(client.getServerPeerName(), localAddr, remoteAddr, length, client.getLocalToken(), client.getRemoteToken(), msg);
 
         } catch (Exception e) {
           logger.error("dispatchPushMergedData: Failed for slot {}", slot, e);
