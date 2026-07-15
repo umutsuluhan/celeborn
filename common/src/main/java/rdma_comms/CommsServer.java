@@ -304,13 +304,23 @@ public class CommsServer {
             handleFetchChunkRequest(ctx, streamId, chunkIndex, slotOffset); // Pass slotOffset directly
           });
         } else if (msg.startsWith("CHUNK_DONE:")) {
-          // Format: CHUNK_DONE:serverOffset
+          // Format: CHUNK_DONE:serverOffset:streamId:chunkIndex
           String[] parts = msg.split(":");
           int serverOffset = Integer.parseInt(parts[1]);
           
           ctx.freeSlots.offer(serverOffset);
           logger.debug("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
               clientPeerName, serverOffset, ctx.freeSlots.size());
+
+          if (parts.length >= 4) {
+             long streamId = Long.parseLong(parts[2]);
+             int chunkIndex = Integer.parseInt(parts[3]);
+             try {
+                comms.notify(clientPeerName, "CLIENT_FETCH_SUCCESS:" + streamId + ":" + chunkIndex);
+             } catch (Exception ne) {
+                logger.error("Failed to bounce CLIENT_FETCH_SUCCESS back to client", ne);
+             }
+          }
         } else if (msg.startsWith("PUSH_DATA:")) {
           // Format: PUSH_DATA:slotOffset:length:shuffleKey:partitionUniqueId
           String[] parts = msg.split(":");

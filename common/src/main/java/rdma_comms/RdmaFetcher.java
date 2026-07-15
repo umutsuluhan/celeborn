@@ -60,11 +60,13 @@ public class RdmaFetcher {
 
   public void processChunkReady(long streamId, int chunkIndex, int length, long serverOffset) {
     String key = streamId + "_" + chunkIndex;
-    FetchTask task = pendingTasks.remove(key);
+    FetchTask task = pendingTasks.get(key); // DO NOT remove yet, we need it in processNetworkFetchDone
     if (task != null) {
+      task.length = length;
+      task.serverOffset = serverOffset;
       logger.info("processChunkReady: Received CHUNK_READY for {}_{} (len: {}, serverOffset: {})", 
           streamId, chunkIndex, length, serverOffset);
-      client.getTransferExecutor().submit(() -> executeRdmaRead(task, length, serverOffset));
+      executeRdmaReadAsync(task, length, serverOffset);
     } else {
       logger.warn("processChunkReady: Received CHUNK_READY for unknown task: {}_{}", streamId, chunkIndex);
       try {
@@ -87,83 +89,61 @@ public class RdmaFetcher {
     }
   }
 
-  private void executeRdmaRead(FetchTask task, int length, long serverOffset) {
+  private void executeRdmaReadAsync(FetchTask task, int length, long serverOffset) {
     long localAddr = client.getLocalBaseAddress() + task.localOffset;
     long remoteAddr = client.getRemoteBaseAddress() + serverOffset;
     
-    logger.debug("executeRdmaRead: Starting JNI postTransfer (Read) for chunk {}_{} (len: {}, serverOffset: {}, localOffset: {})...", 
+    logger.debug("executeRdmaReadAsync: Starting JNI asyncFetch (Read) for chunk {}_{} (len: {}, serverOffset: {}, localOffset: {})...", 
         task.streamId, task.chunkIndex, length, serverOffset, task.localOffset);
 
-    try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
-         CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
-      
-      localIov.addSegment(localAddr, length, client.getLocalToken());
-      remoteIov.addSegment(remoteAddr, length, client.getRemoteToken());
-
-      // Post RDMA Read
-      try (CommsWrapper.Request req = client.getComms().postTransfer(client.getServerPeerName(), CommsWrapper.TransferOpType.Read, localIov, remoteIov, "")) {
-        CommsWrapper.TransferStatus status;
-        long startTime = System.currentTimeMillis();
-        int spinCount = 0;
-        while (req.isInProgress() && client.isRunning()) {
-          if (spinCount < 10) {
-            Thread.onSpinWait();
-            spinCount++;
-          } else {
-            java.util.concurrent.locks.LockSupport.parkNanos(25_000);
-          }
-        }
-        status = req.getStatus();
-
-        long duration = System.currentTimeMillis() - startTime;
-        if (status.state != CommsWrapper.State.Done) {
-          throw new IOException("RDMA Read failed with state: " + status.state + " after " + duration + "ms");
-        }
-        if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-          RDMATracker.recordTransfer(true, length);
-        }
-        logger.debug("executeRdmaRead: JNI transfer complete for chunk {}_{} in {}ms.", task.streamId, task.chunkIndex, duration);
-      }
-
-      logger.debug("executeRdmaRead: Completed processing for chunk {}_{}.", task.streamId, task.chunkIndex);
-
-      ByteBuffer sliced;
-      ByteBuffer duplicate = client.getLocalBuffer().duplicate();
-      duplicate.position(task.localOffset);
-      duplicate.limit(task.localOffset + length);
-      sliced = duplicate.slice();
-
-      ByteBuf customBuf = new CustomRDMAByteBuf(
-          io.netty.buffer.UnpooledByteBufAllocator.DEFAULT,
-          sliced,
-          length,
-          () -> {
-            logger.debug("CustomRDMAByteBuf release hook: Triggered for slot offset {} for chunk {}_{}", 
-                task.localOffset, task.streamId, task.chunkIndex);
-            client.releaseSlot(task.localOffset);
-            try {
-              client.getComms().notify(client.getServerPeerName(), "CHUNK_DONE:" + serverOffset);
-            } catch (Exception ne) {
-              logger.error("CustomRDMAByteBuf release hook: Failed to send CHUNK_DONE to server for {}_{}", 
-                  task.streamId, task.chunkIndex, ne);
-            }
-          }
-      );
-
-      ManagedBuffer managedBuffer = new NettyManagedBuffer(customBuf);
-      task.callback.onSuccess(task.chunkIndex, managedBuffer);
-      managedBuffer.release();
-
+    try {
+      // payload will be processed by CommsServer, which frees the slot and echoes back fetching success.
+      String bouncyMsg = "CHUNK_DONE:" + serverOffset + ":" + task.streamId + ":" + task.chunkIndex;
+      client.getComms().asyncFetch(client.getServerPeerName(), localAddr, remoteAddr, length, client.getLocalToken(), client.getRemoteToken(), bouncyMsg);
     } catch (Exception e) {
-      logger.error("executeRdmaRead: RDMA Read failed for chunk {}_{}", task.streamId, task.chunkIndex, e);
+      logger.error("executeRdmaReadAsync: asyncFetch failed for chunk {}_{}", task.streamId, task.chunkIndex, e);
       task.callback.onFailure(task.chunkIndex, e);
       client.releaseSlot(task.localOffset);
+      pendingTasks.remove(task.streamId + "_" + task.chunkIndex);
       try {
-        client.getComms().notify(client.getServerPeerName(), "CHUNK_DONE:" + serverOffset);
-      } catch (Exception ne) {
-        logger.error("executeRdmaRead: Failed to send CHUNK_DONE on failure for {}_{}", task.streamId, task.chunkIndex, ne);
-      }
+        client.getComms().notify(client.getServerPeerName(), "CHUNK_DONE:" + serverOffset + ":" + task.streamId + ":" + task.chunkIndex);
+      } catch (Exception ne) {}
     }
+  }
+
+  public void processNetworkFetchDone(long streamId, int chunkIndex) {
+    String key = streamId + "_" + chunkIndex;
+    FetchTask task = pendingTasks.remove(key);
+    if (task == null) {
+      logger.warn("processNetworkFetchDone: Received bounce for unknown task: {}_{}", streamId, chunkIndex);
+      return;
+    }
+
+    if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+      RDMATracker.recordTransfer(true, task.length);
+    }
+
+    ByteBuffer sliced;
+    ByteBuffer duplicate = client.getLocalBuffer().duplicate();
+    duplicate.position(task.localOffset);
+    duplicate.limit(task.localOffset + task.length);
+    sliced = duplicate.slice();
+
+    ByteBuf customBuf = new CustomRDMAByteBuf(
+        io.netty.buffer.UnpooledByteBufAllocator.DEFAULT,
+        sliced,
+        task.length,
+        () -> {
+          logger.debug("CustomRDMAByteBuf release hook: Triggered for slot offset {} for chunk {}_{}", 
+              task.localOffset, task.streamId, task.chunkIndex);
+          client.releaseSlot(task.localOffset);
+          // Note: We don't send CHUNK_DONE to the server here, because the C++ asyncFetch poller already sent it!
+        }
+    );
+
+    ManagedBuffer managedBuffer = new NettyManagedBuffer(customBuf);
+    task.callback.onSuccess(task.chunkIndex, managedBuffer);
+    managedBuffer.release();
   }
 
   void releaseSlot(int slotOffset) {
@@ -197,6 +177,8 @@ public class RdmaFetcher {
     final int chunkIndex;
     final ChunkReceivedCallback callback;
     final int localOffset;
+    int length;
+    long serverOffset;
 
     FetchTask(long streamId, int chunkIndex, ChunkReceivedCallback callback, int localOffset) {
       this.streamId = streamId;

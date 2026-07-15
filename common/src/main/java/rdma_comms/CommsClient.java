@@ -355,6 +355,12 @@ public class CommsClient {
           String errorMsg = errorMsgBuilder.toString();
 
           fetcher.processChunkFailed(streamId, chunkIndex, errorMsg);
+        } else if (msg.startsWith("CLIENT_FETCH_SUCCESS:")) {
+          // Format: CLIENT_FETCH_SUCCESS:streamId:chunkIndex
+          String[] parts = msg.split(":");
+          long streamId = Long.parseLong(parts[1]);
+          int chunkIndex = Integer.parseInt(parts[2]);
+          fetcher.processNetworkFetchDone(streamId, chunkIndex);
         } else if (msg.startsWith("PUSH_COMPLETE:")) {
           // Format: PUSH_COMPLETE:slotOffset:statusCode
           String[] parts = msg.split(":");

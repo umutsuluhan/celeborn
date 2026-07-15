@@ -2,7 +2,6 @@ package rdma_comms;
 
 import java.nio.ByteBuffer;
 import java.util.Map;
-import java.util.concurrent.Semaphore;
 
 /**
  * Main entry point for the communication library.
@@ -27,7 +26,7 @@ public class CommsWrapper implements AutoCloseable {
 
   // Holds the raw pointer to the C++ comms::Comms object.
   private final long nativePtr;
-  private final Semaphore transferSemaphore = new Semaphore(128);
+
 
   /**
    * Constructor. Creates the underlying C++ Comms object.
@@ -175,30 +174,13 @@ public class CommsWrapper implements AutoCloseable {
    * Equivalent to 'absl::StatusOr<unique_ptr<Request>> comms::Comms::PostTransfer(...)'.
    */
   public Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
-    long tAcq = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      transferSemaphore.acquire();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new CommsException("Interrupted while waiting for transfer semaphore: " + e.getMessage());
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.SEMAPHORE_ACQUIRE, System.nanoTime() - tAcq);
-      }
-    }
-
-    boolean success = false;
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
       long reqPtr = nativePostTransfer(nativePtr, remotePeer, op.ordinal(), local.getNativePtr(), remote.getNativePtr(), notificationMessage);
-      success = true;
-      return new Request(reqPtr, transferSemaphore);
+      return new Request(reqPtr);
     } finally {
       if (RDMA_TRACKER_ENABLED) {
         RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
-      }
-      if (!success) {
-        transferSemaphore.release();
       }
     }
   }
@@ -217,23 +199,23 @@ public class CommsWrapper implements AutoCloseable {
   public void asyncPush(String remotePeer, long localAddr, long remoteAddr, long length, MemToken localToken, MemToken remoteToken, String notificationMessage) {
     long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
     try {
-      // Blocks if too many concurrent transfers are already running.
-      transferSemaphore.acquire();
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      throw new RuntimeException("Interrupted while acquiring transfer semaphore", e);
-    }
-    try {
       nativeAsyncPush(nativePtr, remotePeer, localAddr, remoteAddr, length, localToken.getNativePtr(), remoteToken.getNativePtr(), notificationMessage);
     } finally {
         if (RDMA_TRACKER_ENABLED) {
             // Just reuse POST_TRANSFER tracker type for now
             RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
         }
-        // Immediately release semaphore as the JNI transitions are done.
-        // Wait, should we release it here if the NIC handles it? 
-        // Yes, the concurrency is managed by the C++ transport internally now or slot counts.
-        transferSemaphore.release();
+    }
+  }
+
+  public void asyncFetch(String remotePeer, long localAddr, long remoteAddr, long length, MemToken localToken, MemToken remoteToken, String notificationMessage) {
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      nativeAsyncFetch(nativePtr, remotePeer, localAddr, remoteAddr, length, localToken.getNativePtr(), remoteToken.getNativePtr(), notificationMessage);
+    } finally {
+        if (RDMA_TRACKER_ENABLED) {
+            RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
+        }
     }
   }
 
@@ -367,11 +349,9 @@ public class CommsWrapper implements AutoCloseable {
     private static final State[] CACHED_STATES = State.values();
     private final long[] scratchStats = new long[1];
     private long nativePtr;
-    private final Semaphore semaphore;
 
-    Request(long nativePtr, Semaphore semaphore) { 
+    Request(long nativePtr) { 
       this.nativePtr = nativePtr; 
-      this.semaphore = semaphore;
     }
     long getNativePtr() { return nativePtr; }
 
@@ -427,9 +407,6 @@ public class CommsWrapper implements AutoCloseable {
           }
         }
         nativePtr = 0;
-        if (semaphore != null) {
-          semaphore.release();
-        }
       }
     }
   }
@@ -451,6 +428,7 @@ public class CommsWrapper implements AutoCloseable {
   private static native long nativeGetMemToken(long nativePtr, byte[] serTok);
   private static native long nativePostTransfer(long nativePtr, String remotePeer, int op, long localIovPtr, long remoteIovPtr, String notificationMessage);
   private static native void nativeAsyncPush(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
+  private static native void nativeAsyncFetch(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
   private static native void nativeNotify(long nativePtr, String remotePeer, String message);
   private static native byte[] nativeGetPeerNotification(long nativePtr, String remotePeer);
   private static native byte[] nativeWaitPeerNotification(long nativePtr, String remotePeer);
