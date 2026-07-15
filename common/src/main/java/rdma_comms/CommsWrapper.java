@@ -2,6 +2,7 @@ package rdma_comms;
 
 import java.nio.ByteBuffer;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Main entry point for the communication library.
@@ -234,34 +235,24 @@ public class CommsWrapper implements AutoCloseable {
     }
   }
 
-  /**
-   * Retrieves the raw message bytes of the earliest unprocessed notification for a peer.
-   * Internally extracts the message from 'NotificationProto' in C++ JNI layer.
-   * Returns null if no notification is pending.
-   */
-  public byte[] getPeerNotification(String remotePeer) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      return nativeGetPeerNotification(nativePtr, remotePeer);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.GET_PEER_NOTIFICATION, System.nanoTime() - t0);
-      }
-    }
+
+  public interface NotificationListener {
+    void onPeerNotification(String remotePeer, byte[] message);
+  }
+
+  private static final Map<Long, NotificationListener> listeners = new ConcurrentHashMap<>();
+
+  public void setNotificationListener(NotificationListener listener) {
+    listeners.put(this.nativePtr, listener);
   }
 
   /**
-   * Retrieves the raw message bytes of the earliest unprocessed notification for a peer.
-   * Blocks indefinitely until a notification is available.
+   * Called by the C++ DispatcherLoop thread via JNI.
    */
-  public byte[] waitPeerNotification(String remotePeer) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      return nativeWaitPeerNotification(nativePtr, remotePeer);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.GET_PEER_NOTIFICATION, System.nanoTime() - t0);
-      }
+  public static void dispatchPeerNotification(long nativePtr, String remotePeer, byte[] messageBytes) {
+    NotificationListener listener = listeners.get(nativePtr);
+    if (listener != null) {
+      listener.onPeerNotification(remotePeer, messageBytes);
     }
   }
 
@@ -269,8 +260,13 @@ public class CommsWrapper implements AutoCloseable {
    * Destructor. Frees the underlying C++ Comms object.
    * Equivalent to 'comms::Comms::~Comms()'.
    */
+  /**
+   * Destructor. Frees the underlying C++ Comms object.
+   * Equivalent to 'comms::Comms::~Comms()'.
+   */
   @Override
   public synchronized void close() {
+    listeners.remove(nativePtr);
     nativeDestroy(nativePtr);
   }
 
@@ -430,8 +426,6 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeAsyncPush(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
   private static native void nativeAsyncFetch(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
   private static native void nativeNotify(long nativePtr, String remotePeer, String message);
-  private static native byte[] nativeGetPeerNotification(long nativePtr, String remotePeer);
-  private static native byte[] nativeWaitPeerNotification(long nativePtr, String remotePeer);
 
   private static native byte[] nativeMemTokenSerialize(long tokenPtr);
   private static native long nativeMemTokenGetAddress(long tokenPtr);

@@ -99,7 +99,6 @@ public class CommsClient {
   
   // Threads & Executors
   private ExecutorService transferExecutor;
-  private Thread pollerThread;
   private final AtomicBoolean running = new AtomicBoolean(false);
 
   /**
@@ -274,10 +273,49 @@ public class CommsClient {
           });
           
           this.running.set(true);
-          this.pollerThread = new Thread(this::pollNotifications, "RDMA-Client-Poller");
-          this.pollerThread.setDaemon(true);
-          this.pollerThread.start();
+          
+          this.comms.setNotificationListener((peer, msgBytes) -> {
+            try {
+              String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
+              logger.debug("Received OOB notification from server: {}", msg);
 
+              if (msg.startsWith("CHUNK_READY:")) {
+                String[] parts = msg.split(":");
+                long streamId = Long.parseLong(parts[1]);
+                int chunkIndex = Integer.parseInt(parts[2]);
+                int length = Integer.parseInt(parts[3]);
+                long serverOffset = Long.parseLong(parts[4]);
+                fetcher.processChunkReady(streamId, chunkIndex, length, serverOffset);
+              } else if (msg.startsWith("CHUNK_FAILED:")) {
+                String[] parts = msg.split(":");
+                long streamId = Long.parseLong(parts[1]);
+                int chunkIndex = Integer.parseInt(parts[2]);
+                StringBuilder errorMsgBuilder = new StringBuilder();
+                for (int idx = 3; idx < parts.length; idx++) {
+                  if (idx > 3) errorMsgBuilder.append(":");
+                  errorMsgBuilder.append(parts[idx]);
+                }
+                fetcher.processChunkFailed(streamId, chunkIndex, errorMsgBuilder.toString());
+              } else if (msg.startsWith("CLIENT_FETCH_SUCCESS:")) {
+                String[] parts = msg.split(":");
+                long streamId = Long.parseLong(parts[1]);
+                int chunkIndex = Integer.parseInt(parts[2]);
+                fetcher.processNetworkFetchDone(streamId, chunkIndex);
+              } else if (msg.startsWith("PUSH_COMPLETE:")) {
+                String[] parts = msg.split(":");
+                int slotOffset = Integer.parseInt(parts[1]);
+                byte statusCode = 0;
+                if (parts.length > 2) statusCode = Byte.parseByte(parts[2]);
+                pusher.processPushComplete(slotOffset, statusCode);
+              } else if (msg.startsWith("PUSH_FAILED:")) {
+                String[] parts = msg.split(":");
+                int slotOffset = Integer.parseInt(parts[1]);
+                pusher.processPushFailed(slotOffset, parts[2]);
+              }
+            } catch (Throwable t) {
+              logger.error("FATAL: Error handling JNI upcall notification", t);
+            }
+          });
           logger.info("Control plane setup complete. Ready for RDMA transfer.");
         }
       } catch (Exception e) {
@@ -321,71 +359,6 @@ public class CommsClient {
     }
   }
 
-  private void pollNotifications() {
-    logger.info("RDMA Client Poller thread started.");
-    while (running.get()) {
-      try {
-        byte[] msgBytes = comms.waitPeerNotification(serverPeerName);
-        if (msgBytes == null) {
-          continue;
-        }
-
-        String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
-        logger.debug("Received OOB notification from server: {}", msg);
-
-        if (msg.startsWith("CHUNK_READY:")) {
-          // Format: CHUNK_READY:streamId:chunkIndex:length:serverOffset
-          String[] parts = msg.split(":");
-          long streamId = Long.parseLong(parts[1]);
-          int chunkIndex = Integer.parseInt(parts[2]);
-          int length = Integer.parseInt(parts[3]);
-          long serverOffset = Long.parseLong(parts[4]);
-
-          fetcher.processChunkReady(streamId, chunkIndex, length, serverOffset);
-        } else if (msg.startsWith("CHUNK_FAILED:")) {
-          // Format: CHUNK_FAILED:streamId:chunkIndex:errorMsg
-          String[] parts = msg.split(":");
-          long streamId = Long.parseLong(parts[1]);
-          int chunkIndex = Integer.parseInt(parts[2]);
-          StringBuilder errorMsgBuilder = new StringBuilder();
-          for (int idx = 3; idx < parts.length; idx++) {
-            if (idx > 3) errorMsgBuilder.append(":");
-            errorMsgBuilder.append(parts[idx]);
-          }
-          String errorMsg = errorMsgBuilder.toString();
-
-          fetcher.processChunkFailed(streamId, chunkIndex, errorMsg);
-        } else if (msg.startsWith("CLIENT_FETCH_SUCCESS:")) {
-          // Format: CLIENT_FETCH_SUCCESS:streamId:chunkIndex
-          String[] parts = msg.split(":");
-          long streamId = Long.parseLong(parts[1]);
-          int chunkIndex = Integer.parseInt(parts[2]);
-          fetcher.processNetworkFetchDone(streamId, chunkIndex);
-        } else if (msg.startsWith("PUSH_COMPLETE:")) {
-          // Format: PUSH_COMPLETE:slotOffset:statusCode
-          String[] parts = msg.split(":");
-          int slotOffset = Integer.parseInt(parts[1]);
-          byte statusCode = 0;
-          if (parts.length > 2) {
-            statusCode = Byte.parseByte(parts[2]);
-          }
-          pusher.processPushComplete(slotOffset, statusCode);
-        } else if (msg.startsWith("PUSH_FAILED:")) {
-          // Format: PUSH_FAILED:slotOffset:errorMsg
-          String[] parts = msg.split(":");
-          int slotOffset = Integer.parseInt(parts[1]);
-          String errorMsg = parts[2];
-          pusher.processPushFailed(slotOffset, errorMsg);
-        }
-
-      } catch (Throwable t) {
-        logger.error("FATAL: Error in OOB poller thread", t);
-        break;
-      }
-    }
-    logger.info("RDMA Client Poller thread stopped. Failing any pending tasks...");
-    failPendingTasks(new IOException("Connection lost or poller thread stopped"));
-  }
 
   private void failPendingTasks(Throwable cause) {
     logger.info("Failing all pending tasks.");
@@ -399,14 +372,7 @@ public class CommsClient {
   public void shutdown() {
     running.set(false);
     failPendingTasks(new IOException("CommsClient was shut down"));
-    if (pollerThread != null) {
-      pollerThread.interrupt();
-      try {
-        pollerThread.join(1000);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
+
     if (transferExecutor != null) {
       transferExecutor.shutdownNow();
     }

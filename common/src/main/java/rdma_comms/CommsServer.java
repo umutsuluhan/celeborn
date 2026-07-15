@@ -133,6 +133,7 @@ public class CommsServer {
 
       comms.init(params);
       logger.info("Comms library initialized.");
+      comms.setNotificationListener(this::handleNotification);
 
       this.running.set(true);
       this.fetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(64, r -> {
@@ -228,16 +229,8 @@ public class CommsServer {
         freeSlots.offer(pushBoundary + i * this.fetchSlotSize);
       }
 
-      // Start OOB notification poller thread for this client
       ClientContext ctx = new ClientContext(clientPeerName, clientBuffer, clientToken, freeSlots, null);
-      
-      Thread poller = new Thread(() -> pollClientNotifications(clientPeerName), "RDMA-Server-Poller-" + clientPeerName);
-      poller.setDaemon(true);
-      ctx.pollerThread = poller;
-      
       clientContexts.put(clientPeerName, ctx);
-      
-      poller.start();
 
       // Send server handles and memory token back to the client
       byte[] serverHandleOpaque = comms.getEndpointInfo();
@@ -268,27 +261,14 @@ public class CommsServer {
     }
   }
 
-  /**
-   * Background loop that polls for OOB notifications from a specific client.
-   */
-  private void pollClientNotifications(String clientPeerName) {
-    logger.info("RDMA Server Poller thread started for client: {}", clientPeerName);
+  private void handleNotification(String clientPeerName, byte[] msgBytes) {
     ClientContext ctx = clientContexts.get(clientPeerName);
     if (ctx == null) {
       logger.error("ClientContext not found for client: {}", clientPeerName);
       return;
     }
-
-    while (running.get() && ctx.running.get()) {
-      try {
-        byte[] msgBytes = comms.waitPeerNotification(clientPeerName);
-        if (msgBytes == null) {
-          if (Thread.currentThread().isInterrupted()) {
-            break;
-          }
-          continue;
-        }
-
+    
+    try {
         String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
         logger.debug("Received OOB notification from client {}: {}", clientPeerName, msg);
 
@@ -309,7 +289,7 @@ public class CommsServer {
           int serverOffset = Integer.parseInt(parts[1]);
           
           ctx.freeSlots.offer(serverOffset);
-          logger.debug("pollClientNotifications: Client {} released slot at offset {}. Free slots: {}", 
+          logger.debug("handleNotification: Client {} released slot at offset {}. Free slots: {}", 
               clientPeerName, serverOffset, ctx.freeSlots.size());
 
           if (parts.length >= 4) {
@@ -347,20 +327,15 @@ public class CommsServer {
               .mapToInt(Integer::parseInt)
               .toArray();
           
-          logger.debug("pollClientNotifications: Queuing merged push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
+          logger.debug("handleNotification: Queuing merged push request for slot {} from client {} in fetchExecutor.", slotOffset, clientPeerName);
           fetchExecutor.submit(() -> {
             logger.debug("handlePushMergedDataRequest: Task started executing for slot {} from client {}", slotOffset, clientPeerName);
             handlePushMergedDataRequest(ctx, slotOffset, length, shuffleKey, partitionUniqueIds, offsets);
           });
         }
-
-
-      } catch (Throwable t) {
-        logger.error("FATAL: Error in poller thread for client {}", clientPeerName, t);
-        break;
-      }
+    } catch (Throwable t) {
+        logger.error("FATAL: Error in notification callback for client {}", clientPeerName, t);
     }
-    logger.info("RDMA Server Poller thread stopped for client: {}", clientPeerName);
   }
 
   private void handlePushDataRequest(ClientContext ctx, int slotOffset, int length, String shuffleKey, String partitionUniqueId) {
@@ -560,11 +535,6 @@ public class CommsServer {
 
     // Stop all client poller and scheduler threads, and deregister client memory
     for (ClientContext ctx : clientContexts.values()) {
-      ctx.running.set(false);
-      if (ctx.pollerThread != null) {
-        ctx.pollerThread.interrupt();
-      }
-
       if (ctx.localToken != null && ctx.localBuffer != null) {
       try {
           comms.deregAndFreeMem(ctx.localBuffer, ctx.localToken);
@@ -605,8 +575,6 @@ public class CommsServer {
     final ByteBuffer localBuffer;
     final CommsWrapper.MemToken localToken;
     final BlockingQueue<Integer> freeSlots;
-    Thread pollerThread;
-    final java.util.concurrent.atomic.AtomicBoolean running = new java.util.concurrent.atomic.AtomicBoolean(true);
 
     ClientContext(String peerName, ByteBuffer localBuffer, CommsWrapper.MemToken localToken, 
                   BlockingQueue<Integer> freeSlots, Object dummyReadyQueue) {
