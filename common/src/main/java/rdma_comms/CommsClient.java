@@ -102,10 +102,6 @@ public class CommsClient {
   private final java.util.Queue<FetchRequest> waitingQueue = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
   // New fields for read batching
-  private final BlockingQueue<FetchTask> fetchRequestQueue = new LinkedBlockingQueue<>();
-  private Thread fetchRequestSchedulerThread;
-  private final BlockingQueue<FetchTask> readQueue = new LinkedBlockingQueue<>();
-  private Thread readSchedulerThread;
   
   // Threads & Executors
   private ExecutorService transferExecutor;
@@ -113,8 +109,6 @@ public class CommsClient {
   private final AtomicBoolean running = new AtomicBoolean(false);
 
   // Batching fields
-  private final BlockingQueue<PushRequest> pushQueue = new LinkedBlockingQueue<>();
-  private Thread batchSchedulerThread;
 
   /**
    * Constructor.
@@ -287,17 +281,7 @@ public class CommsClient {
         this.pollerThread.setDaemon(true);
         this.pollerThread.start();
 
-        this.batchSchedulerThread = new Thread(this::runBatchScheduler, "RDMA-Client-Batch-Scheduler");
-        this.batchSchedulerThread.setDaemon(true);
-        this.batchSchedulerThread.start();
 
-        this.fetchRequestSchedulerThread = new Thread(this::runFetchRequestScheduler, "RDMA-Client-Fetch-Request-Scheduler");
-        this.fetchRequestSchedulerThread.setDaemon(true);
-        this.fetchRequestSchedulerThread.start();
-
-        this.readSchedulerThread = new Thread(this::runReadScheduler, "RDMA-Client-Read-Scheduler");
-        this.readSchedulerThread.setDaemon(true);
-        this.readSchedulerThread.start();
 
         logger.info("Control plane setup complete. Ready for RDMA transfer.");
       }
@@ -318,21 +302,17 @@ public class CommsClient {
   public void fetchChunk(long streamId, int chunkIndex, ChunkReceivedCallback callback) {
     long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
     try {
-    if (!running.get()) {
-      callback.onFailure(chunkIndex, new IllegalStateException("CommsClient is not running"));
-      return;
-    }
+      if (!running.get()) {
+        callback.onFailure(chunkIndex, new IllegalStateException("CommsClient is not running"));
+        return;
+      }
 
-    Integer slot = fetchFreeSlots.poll();
-    if (slot != null) {
-      logger.debug("fetchChunk: Acquired fetch slot offset {} for chunk {}_{} immediately. Free fetch slots: {}, Queue size: {}", 
-          slot, streamId, chunkIndex, fetchFreeSlots.size(), waitingQueue.size());
-      dispatchFetch(streamId, chunkIndex, callback, slot);
-    } else {
-      logger.debug("fetchChunk: No fetch slots available for chunk {}_{}. Queueing request. Free fetch slots: 0, Queue size: {}", 
-          streamId, chunkIndex, waitingQueue.size() + 1);
-      waitingQueue.offer(new FetchRequest(streamId, chunkIndex, callback));
-    }
+      Integer slot = fetchFreeSlots.poll();
+      if (slot != null) {
+        dispatchFetchDirect(streamId, chunkIndex, callback, slot);
+      } else {
+        waitingQueue.offer(new FetchRequest(streamId, chunkIndex, callback));
+      }
     } finally {
       if (rdmaTrackerEnabled) {
         rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_FETCH_CHUNK, System.nanoTime() - t0_tracker);
@@ -340,170 +320,148 @@ public class CommsClient {
     }
   }
 
+  private void dispatchFetchDirect(long streamId, int chunkIndex, ChunkReceivedCallback callback, int slot) {
+    try {
+      FetchTask task = new FetchTask(streamId, chunkIndex, callback, slot);
+      String key = streamId + "_" + chunkIndex;
+      pendingTasks.put(key, task);
+      comms.notify(serverPeerName, "FETCH_REQUEST:" + streamId + ":" + chunkIndex + ":" + slot);
+    } catch (Exception e) {
+      callback.onFailure(chunkIndex, e);
+      releaseSlot(slot);
+    }
+  }
+
+
+
   /**
    * Asynchronously pushes data via RDMA.
    */
   public void pushData(byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
-    if (!running.get()) {
-      callback.onFailure(new IllegalStateException("CommsClient is not running"));
-      return;
-    }
-
-    Integer slot;
+    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
     try {
-      slot = pushFreeSlots.take(); // Block until a push slot is available
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      callback.onFailure(e);
-      return;
-    }
+      if (!running.get()) {
+        callback.onFailure(new IllegalStateException("CommsClient is not running"));
+        return;
+      }
 
-    logger.debug("pushData: Acquired push slot offset {} for push to {} partition {}. Queueing for batching.", 
-        slot, shuffleKey, partitionUniqueId);
-    
-    pushQueue.offer(new PushRequest(body, shuffleKey, partitionUniqueId, callback, slot));
-  }
-
-  private void runBatchScheduler() {
-    logger.info("RDMA Client Batch Scheduler thread started. Target size: {}, Linger: {}ms", writeBatchSize, writeLingerMs);
-    while (running.get()) {
+      Integer slot;
       try {
-        // Create a new list for each batch to avoid ConcurrentModificationException in async dispatch
-        java.util.List<PushRequest> batch = new java.util.ArrayList<>();
-        // Block until at least one request is available
-        PushRequest first = pushQueue.take();
-        batch.add(first);
-
-        if (writeLingerMs > 0) {
-          long startTime = System.currentTimeMillis();
-          while (batch.size() < writeBatchSize && running.get()) {
-            long elapsed = System.currentTimeMillis() - startTime;
-            long remaining = writeLingerMs - elapsed;
-            if (remaining <= 0) break;
-            
-            PushRequest next = pushQueue.poll(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (next != null) {
-              batch.add(next);
-            } else {
-              break;
-            }
-          }
-        } else {
-          pushQueue.drainTo(batch, writeBatchSize - 1);
-        }
-
-        if (!batch.isEmpty()) {
-          dispatchBatch(batch);
-        }
+        slot = pushFreeSlots.take();
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
-        break;
-      } catch (Throwable t) {
-        logger.error("Error in Batch Scheduler thread", t);
+        callback.onFailure(e);
+        return;
       }
-    }
-    logger.info("RDMA Client Batch Scheduler thread stopped.");
-  }
 
-  private void dispatchBatch(java.util.List<PushRequest> batch) {
-    if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-      RDMATracker.recordBatchSize(RDMATracker.BatchType.CLIENT_PUSH, batch.size());
-    }
-    transferExecutor.submit(() -> {
-      try {
-        // 1. Copy all bodies into localBuffer at their respective slots
-        for (PushRequest req : batch) {
-          ByteBuffer duplicate = localBuffer.duplicate();
-          duplicate.position(req.slot);
-          duplicate.put(req.body);
-          
-          // Register callback
-          pendingPushes.put(req.slot, req.callback);
-        }
-
-        // 2. Create IOVs with multiple segments
-        try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
-             CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
-          
-          for (PushRequest req : batch) {
-            long localAddr = localBaseAddress + req.slot;
-            long remoteAddr = remoteBaseAddress + req.slot;
-            localIov.addSegment(localAddr, req.body.length, localToken);
-            remoteIov.addSegment(remoteAddr, req.body.length, remoteToken);
+      transferExecutor.submit(() -> {
+        try {
+          ByteBuffer duplicate;
+          synchronized (localBuffer) {
+              duplicate = localBuffer.duplicate();
           }
+          duplicate.position(slot);
+          duplicate.put(body);
+          pendingPushes.put(slot, callback);
 
-          // 3. Post SINGLE RDMA Write for the whole batch
-          try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
-            long startTime = System.currentTimeMillis();
-            CommsWrapper.TransferStatus status = req.waitCompletion();
+          long localAddr = localBaseAddress + slot;
+          long remoteAddr = remoteBaseAddress + slot;
+          int length = body.length;
 
-            long duration = System.currentTimeMillis() - startTime;
-            if (status.state != CommsWrapper.State.Done) {
-              throw new IOException("RDMA Batch Write failed with state: " + status.state + " after " + duration + "ms");
-            }
-            if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-              long totalBytes = 0;
-              for (PushRequest r : batch) {
-                totalBytes += r.body.length;
+          try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
+               CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
+            
+            localIov.addSegment(localAddr, length, localToken);
+            remoteIov.addSegment(remoteAddr, length, remoteToken);
+
+            try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
+              CommsWrapper.TransferStatus status = req.waitCompletion();
+              if (status.state != CommsWrapper.State.Done) {
+                throw new java.io.IOException("RDMA Write failed with state: " + status.state);
               }
-              RDMATracker.recordTransfer(false, totalBytes);
+              if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+                rdma_comms.RDMATracker.recordTransfer(false, length);
+              }
             }
-            logger.debug("dispatchBatch: RDMA Write complete for batch of size {} in {}ms.", batch.size(), duration);
           }
-        }
 
-        // 4. Send ONE OOB notification for the whole batch
-        StringBuilder sb = new StringBuilder("BATCH_PUSH_DATA:");
-        for (int i = 0; i < batch.size(); i++) {
-          if (i > 0) sb.append("|");
-          PushRequest req = batch.get(i);
-          if (req.isMerged) {
-            String pIds = String.join(",", req.partitionUniqueIds);
-            String offs = java.util.Arrays.stream(req.offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
-            sb.append("M,").append(req.slot).append(",").append(req.body.length).append(",").append(req.shuffleKey).append(",").append(pIds).append(";").append(offs);
-          } else {
-            sb.append("S,").append(req.slot).append(",").append(req.body.length).append(",").append(req.shuffleKey).append(",").append(req.partitionUniqueId);
-          }
-        }
-        String msg = sb.toString();
-        logger.info("dispatchBatch: Sending BATCH_PUSH_DATA OOB for batch of size {} to server.", batch.size());
-        
-        comms.notify(serverPeerName, msg);
+          String msg = "PUSH_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + partitionUniqueId;
+          comms.notify(serverPeerName, msg);
 
-      } catch (Exception e) {
-        logger.error("dispatchBatch: Failed for batch", e);
-        for (PushRequest req : batch) {
-          pendingPushes.remove(req.slot);
-          req.callback.onFailure(e);
-          releaseSlot(req.slot);
+        } catch (Exception e) {
+          logger.error("dispatchPushData: Failed for slot {}", slot, e);
+          pendingPushes.remove(slot);
+          callback.onFailure(e);
+          releaseSlot(slot);
         }
+      });
+    } finally {
+      if (rdmaTrackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_DATA, System.nanoTime() - t0_tracker);
       }
-    });
+    }
   }
 
-  /**
-   * Asynchronously pushes merged data via RDMA.
-   */
   public void pushMergedData(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
     long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
     try {
-    if (!running.get()) {
-      callback.onFailure(new IllegalStateException("CommsClient is not running"));
-      return;
-    }
+      if (!running.get()) {
+        callback.onFailure(new IllegalStateException("CommsClient is not running"));
+        return;
+      }
 
-    Integer slot;
-    try {
-      slot = pushFreeSlots.take(); // Block until a push slot is available
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      callback.onFailure(e);
-      return;
-    }
+      Integer slot;
+      try {
+        slot = pushFreeSlots.take();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        callback.onFailure(e);
+        return;
+      }
 
-    logger.debug("pushMergedData: Acquired push slot offset {} for merged push to {}. Partitions: {}, Free push slots: {}, Queue size: {}", 
-        slot, shuffleKey, java.util.Arrays.toString(partitionUniqueIds), pushFreeSlots.size(), waitingQueue.size());
-    pushQueue.offer(new PushRequest(body, shuffleKey, partitionUniqueIds, offsets, callback, slot));
+      transferExecutor.submit(() -> {
+        try {
+          ByteBuffer duplicate;
+          synchronized (localBuffer) {
+              duplicate = localBuffer.duplicate();
+          }
+          duplicate.position(slot);
+          duplicate.put(body);
+          pendingPushes.put(slot, callback);
+
+          long localAddr = localBaseAddress + slot;
+          long remoteAddr = remoteBaseAddress + slot;
+          int length = body.length;
+
+          try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
+               CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
+            
+            localIov.addSegment(localAddr, length, localToken);
+            remoteIov.addSegment(remoteAddr, length, remoteToken);
+
+            try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Write, localIov, remoteIov, "")) {
+              CommsWrapper.TransferStatus status = req.waitCompletion();
+              if (status.state != CommsWrapper.State.Done) {
+                throw new java.io.IOException("RDMA Merged Write failed with state: " + status.state);
+              }
+              if (CommsWrapper.RDMA_TRACKER_ENABLED) {
+                rdma_comms.RDMATracker.recordTransfer(false, length);
+              }
+            }
+          }
+
+          String pIds = String.join(",", partitionUniqueIds);
+          String offs = java.util.Arrays.stream(offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+          String msg = "PUSH_MERGED_DATA:" + slot + ":" + length + ":" + shuffleKey + ":" + pIds + ";" + offs;
+          comms.notify(serverPeerName, msg);
+
+        } catch (Exception e) {
+          logger.error("dispatchPushMergedData: Failed for slot {}", slot, e);
+          pendingPushes.remove(slot);
+          callback.onFailure(e);
+          releaseSlot(slot);
+        }
+      });
     } finally {
       if (rdmaTrackerEnabled) {
         rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0_tracker);
@@ -511,263 +469,42 @@ public class CommsClient {
     }
   }
 
-  private void dispatchFetch(long streamId, int chunkIndex, ChunkReceivedCallback callback, int slot) {
-    try {
-      FetchTask task = new FetchTask(streamId, chunkIndex, callback, slot);
-      String key = streamId + "_" + chunkIndex;
-      pendingTasks.put(key, task);
 
-      fetchRequestQueue.offer(task);
-      logger.info("dispatchFetch: Queued FETCH_CHUNK for {}_{} with slot offset {}. Pending tasks count: {}", 
-          streamId, chunkIndex, slot, pendingTasks.size());
-    } catch (Exception e) {
-      logger.error("dispatchFetch: Failed to dispatch fetch for {}_{}", streamId, chunkIndex, e);
-      callback.onFailure(chunkIndex, e);
-      releaseSlot(slot);
-    }
-  }
-
-  private void runFetchRequestScheduler() {
-    logger.info("RDMA Client Fetch Request Scheduler thread started. Target size: {}, Linger: {}ms", readBatchSize, readLingerMs);
-    while (running.get()) {
-      try {
-        java.util.List<FetchTask> batch = new java.util.ArrayList<>();
-        FetchTask first = fetchRequestQueue.take();
-        batch.add(first);
-
-        if (readLingerMs > 0) {
-          long startTime = System.currentTimeMillis();
-          while (batch.size() < readBatchSize && running.get()) {
-            long elapsed = System.currentTimeMillis() - startTime;
-            long remaining = readLingerMs - elapsed;
-            if (remaining <= 0) break;
-            
-            FetchTask next = fetchRequestQueue.poll(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (next != null) {
-              batch.add(next);
-            } else {
-              break;
-            }
-          }
-        } else {
-          fetchRequestQueue.drainTo(batch, readBatchSize - 1);
-        }
-        
-        if (!batch.isEmpty()) {
-          StringBuilder sb = new StringBuilder("BATCH_FETCH_CHUNK:");
-          for (int i = 0; i < batch.size(); i++) {
-            if (i > 0) sb.append(";");
-            FetchTask task = batch.get(i);
-            sb.append(task.streamId).append(",")
-              .append(task.chunkIndex);
-          }
-          comms.notify(serverPeerName, sb.toString());
-        }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        break;
-      } catch (Exception e) {
-        logger.error("Error in Fetch Request Scheduler thread", e);
-      }
-    }
-    logger.info("RDMA Client Fetch Request Scheduler thread stopped.");
-  }
-
-  private void runReadScheduler() {
-    logger.info("RDMA Client Read Scheduler thread started. Target size: {}, Linger: {}ms", readBatchSize, readLingerMs);
-    while (running.get()) {
-      try {
-        java.util.List<FetchTask> batch = new java.util.ArrayList<>();
-        FetchTask first = readQueue.take();
-        batch.add(first);
-
-        if (readLingerMs > 0) {
-          long startTime = System.currentTimeMillis();
-          while (batch.size() < readBatchSize && running.get()) {
-            long elapsed = System.currentTimeMillis() - startTime;
-            long remaining = readLingerMs - elapsed;
-            if (remaining <= 0) break;
-            
-            FetchTask next = readQueue.poll(remaining, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (next != null) {
-              batch.add(next);
-            } else {
-              break;
-            }
-          }
-        } else {
-          readQueue.drainTo(batch, readBatchSize - 1);
-        }
-        
-        if (!batch.isEmpty()) {
-          dispatchBatchRead(batch);
-        }
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-        break;
-      } catch (Exception e) {
-        logger.error("Error in Read Scheduler thread", e);
-      }
-    }
-    logger.info("RDMA Client Read Scheduler thread stopped.");
-  }
-
-  private void dispatchBatchRead(java.util.List<FetchTask> batch) {
-    long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
-    try {
-    if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-      RDMATracker.recordBatchSize(RDMATracker.BatchType.CLIENT_FETCH, batch.size());
-    }
-    transferExecutor.submit(() -> {
-      try {
-        try (CommsWrapper.TransferIov localIov = new CommsWrapper.TransferIov(false);
-             CommsWrapper.TransferIov remoteIov = new CommsWrapper.TransferIov(true)) {
-          
-          for (FetchTask task : batch) {
-            long localAddr = localBaseAddress + task.localOffset;
-            long remoteAddr = remoteBaseAddress + task.serverOffset;
-            localIov.addSegment(localAddr, task.length, localToken);
-            remoteIov.addSegment(remoteAddr, task.length, remoteToken);
-          }
-          
-          try (CommsWrapper.Request req = comms.postTransfer(serverPeerName, CommsWrapper.TransferOpType.Read, localIov, remoteIov, "")) {
-            long startTime = System.currentTimeMillis();
-            CommsWrapper.TransferStatus status = req.waitCompletion();
-
-            long duration = System.currentTimeMillis() - startTime;
-            if (status.state != CommsWrapper.State.Done) {
-              throw new java.io.IOException("RDMA Batch Read failed with state: " + status.state + " after " + duration + "ms");
-            }
-            if (CommsWrapper.RDMA_TRACKER_ENABLED) {
-              long totalBytes = 0;
-              for (FetchTask task : batch) {
-                totalBytes += task.length;
-              }
-              RDMATracker.recordTransfer(true, totalBytes);
-            }
-            logger.info("dispatchBatchRead: RDMA Read complete for batch of size {} in {}ms.", batch.size(), duration);
-          }
-        }
-        
-        for (FetchTask task : batch) {
-          ByteBuffer sliced;
-          synchronized (localBuffer) {
-            ByteBuffer duplicate = localBuffer.duplicate();
-            duplicate.position(task.localOffset);
-            duplicate.limit(task.localOffset + task.length);
-            sliced = duplicate.slice();
-          }
-          
-          ByteBuf customBuf = new CustomRDMAByteBuf(
-              io.netty.buffer.UnpooledByteBufAllocator.DEFAULT,
-              sliced,
-              task.length,
-              () -> {
-                logger.info("CustomRDMAByteBuf release hook: Triggered for slot offset {} for chunk {}_{}", 
-                    task.localOffset, task.streamId, task.chunkIndex);
-                releaseSlot(task.localOffset);
-                try {
-                  comms.notify(serverPeerName, "CHUNK_DONE:" + task.serverOffset);
-                } catch (Exception ne) {
-                  logger.error("CustomRDMAByteBuf release hook: Failed to send CHUNK_DONE to server for {}_{}", 
-                      task.streamId, task.chunkIndex, ne);
-                }
-              }
-          );
-          
-          ManagedBuffer managedBuffer = new NettyManagedBuffer(customBuf);
-          task.callback.onSuccess(task.chunkIndex, managedBuffer);
-          managedBuffer.release();
-        }
-        
-      } catch (Exception e) {
-        logger.error("dispatchBatchRead: Failed for batch", e);
-        for (FetchTask task : batch) {
-          task.callback.onFailure(task.chunkIndex, e);
-          releaseSlot(task.localOffset);
-          try {
-            comms.notify(serverPeerName, "CHUNK_DONE:" + task.serverOffset);
-          } catch (Exception ne) {
-            logger.error("dispatchBatchRead: Failed to send CHUNK_DONE on failure for {}_{}", task.streamId, task.chunkIndex, ne);
-          }
-        }
-      }
-    });
-    } finally {
-      if (rdmaTrackerEnabled) {
-        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_BATCH_READ, System.nanoTime() - t0_tracker);
-      }
-    }
-  }
-
-  private void releaseSlot(int slot) {
-    if (slot < this.pushBoundary) {
-      pushFreeSlots.offer(slot);
-      logger.debug("releaseSlot: Returned push slot offset {} to pool. Free push slots: {}", 
-          slot, pushFreeSlots.size());
-    } else {
-      FetchRequest nextReq = waitingQueue.poll();
-      if (nextReq != null) {
-        logger.debug("releaseSlot: Reusing released fetch slot offset {} for queued request {}_{}. Remaining in queue: {}", 
-            slot, nextReq.streamId, nextReq.chunkIndex, waitingQueue.size());
-        dispatchFetch(nextReq.streamId, nextReq.chunkIndex, nextReq.callback, slot);
-      } else {
-        fetchFreeSlots.offer(slot);
-        logger.debug("releaseSlot: Returned fetch slot offset {} to pool. Free fetch slots: {}, Queue size: {}", 
-            slot, fetchFreeSlots.size(), waitingQueue.size());
-      }
-    }
-  }
-
-  /**
-   * Background loop that polls for OOB notifications from the server.
-   */
   private void pollNotifications() {
     logger.info("RDMA Client Poller thread started.");
     while (running.get()) {
       try {
-        byte[] msgBytes = comms.getPeerNotification(serverPeerName);
+        byte[] msgBytes = comms.waitPeerNotification(serverPeerName);
         if (msgBytes == null) {
-          // getPeerNotification is non-blocking in current JNI if no notifications,
-          // so sleep briefly to prevent busy waiting.
-          java.util.concurrent.locks.LockSupport.parkNanos(500_000); // 500 us
-          if (Thread.currentThread().isInterrupted()) {
-            break;
-          }
           continue;
         }
 
         String msg = new String(msgBytes, java.nio.charset.StandardCharsets.UTF_8);
         logger.debug("Received OOB notification from server: {}", msg);
 
-        if (msg.startsWith("BATCH_CHUNK_READY:")) {
-          // Format: BATCH_CHUNK_READY:streamId1,chunk1,len1,offset1;streamId2,chunk2,len2,offset2;...
-          String[] parts = msg.split(":", 2);
-          if (parts.length < 2 || parts[1].isEmpty()) {
-            logger.warn("pollNotifications: Received empty BATCH_CHUNK_READY");
-            continue;
-          }
-          String[] items = parts[1].split(";");
-          for (String item : items) {
-            String[] fields = item.split(",");
-            long streamId = Long.parseLong(fields[0]);
-            int chunkIndex = Integer.parseInt(fields[1]);
-            int length = Integer.parseInt(fields[2]);
-            long serverOffset = Long.parseLong(fields[3]);
+        if (msg.startsWith("CHUNK_READY:")) {
+          // Format: CHUNK_READY:streamId:chunkIndex:length:serverOffset
+          String[] parts = msg.split(":");
+          long streamId = Long.parseLong(parts[1]);
+          int chunkIndex = Integer.parseInt(parts[2]);
+          int length = Integer.parseInt(parts[3]);
+          long serverOffset = Long.parseLong(parts[4]);
 
-            String key = streamId + "_" + chunkIndex;
-            FetchTask task = pendingTasks.remove(key);
-            if (task != null) {
-              task.length = length;
-              task.serverOffset = serverOffset;
-              readQueue.offer(task);
-              logger.info("pollNotifications: Queued ready chunk {}_{} (len: {}, serverOffset: {}) for batch read.", 
-                  streamId, chunkIndex, length, serverOffset);
-            } else {
-              logger.warn("pollNotifications: Received BATCH_CHUNK_READY for unknown task: {}_{}", streamId, chunkIndex);
+          String key = streamId + "_" + chunkIndex;
+          FetchTask task = pendingTasks.remove(key);
+          if (task != null) {
+            logger.info("pollNotifications: Received CHUNK_READY for {}_{} (len: {}, serverOffset: {})", 
+                streamId, chunkIndex, length, serverOffset);
+            transferExecutor.submit(() -> executeRdmaRead(task, length, serverOffset));
+          } else {
+            logger.warn("pollNotifications: Received CHUNK_READY for unknown task: {}_{}", streamId, chunkIndex);
+            try {
               comms.notify(serverPeerName, "CHUNK_DONE:" + serverOffset);
+            } catch (Exception e) {
+              logger.error("Failed to notify CHUNK_DONE for unknown task", e);
             }
           }
+
         } else if (msg.startsWith("CHUNK_FAILED:")) {
           // Format: CHUNK_FAILED:streamId:chunkIndex:errorMsg
           String[] parts = msg.split(":");
@@ -946,47 +683,7 @@ public class CommsClient {
    */
   public void shutdown() {
     running.set(false);
-    if (batchSchedulerThread != null) {
-      batchSchedulerThread.interrupt();
-      try {
-        batchSchedulerThread.join(1000);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
-    if (fetchRequestSchedulerThread != null) {
-      fetchRequestSchedulerThread.interrupt();
-      try {
-        fetchRequestSchedulerThread.join(1000);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
-    if (readSchedulerThread != null) {
-      readSchedulerThread.interrupt();
-      try {
-        readSchedulerThread.join(1000);
-      } catch (InterruptedException e) {
-        Thread.currentThread().interrupt();
-      }
-    }
     failPendingTasks(new IOException("CommsClient was shut down"));
-    // Fail any remaining requests in pushQueue
-    PushRequest req;
-    while ((req = pushQueue.poll()) != null) {
-      req.callback.onFailure(new IOException("CommsClient was shut down"));
-      releaseSlot(req.slot);
-    }
-    // Fail any remaining requests in fetchRequestQueue and readQueue
-    FetchTask fetchTask;
-    while ((fetchTask = fetchRequestQueue.poll()) != null) {
-      fetchTask.callback.onFailure(fetchTask.chunkIndex, new IOException("CommsClient was shut down"));
-      releaseSlot(fetchTask.localOffset);
-    }
-    while ((fetchTask = readQueue.poll()) != null) {
-      fetchTask.callback.onFailure(fetchTask.chunkIndex, new IOException("CommsClient was shut down"));
-      releaseSlot(fetchTask.localOffset);
-    }
     if (pollerThread != null) {
       pollerThread.interrupt();
       try {
@@ -1026,6 +723,25 @@ public class CommsClient {
   public CommsWrapper getComms() { return comms; }
   public ByteBuffer getLocalBuffer() { return localBuffer; }
   public long getRemoteSize() { return remoteSize; }
+
+  private void releaseSlot(int slotOffset) {
+    if (slotOffset < pushBoundary) {
+      pushFreeSlots.offer(slotOffset);
+    } else {
+      fetchFreeSlots.offer(slotOffset);
+      // Try to service pending fetches
+      FetchRequest req = waitingQueue.poll();
+      if (req != null) {
+        Integer newSlot = fetchFreeSlots.poll();
+        if (newSlot != null) {
+          dispatchFetchDirect(req.streamId, req.chunkIndex, req.callback, newSlot);
+        } else {
+          // Put it back
+          waitingQueue.offer(req);
+        }
+      }
+    }
+  }
 
   // -------------------------------------------------------------------------
   // Helper Classes

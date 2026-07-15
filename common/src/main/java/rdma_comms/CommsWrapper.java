@@ -216,6 +216,21 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   /**
+   * Retrieves the raw message bytes of the earliest unprocessed notification for a peer.
+   * Blocks indefinitely until a notification is available.
+   */
+  public byte[] waitPeerNotification(String remotePeer) {
+    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
+    try {
+      return nativeWaitPeerNotification(nativePtr, remotePeer);
+    } finally {
+      if (RDMA_TRACKER_ENABLED) {
+        RDMATracker.record(RDMATracker.CallType.GET_PEER_NOTIFICATION, System.nanoTime() - t0);
+      }
+    }
+  }
+
+  /**
    * Destructor. Frees the underlying C++ Comms object.
    * Equivalent to 'comms::Comms::~Comms()'.
    */
@@ -382,6 +397,7 @@ public class CommsWrapper implements AutoCloseable {
   private static native long nativePostTransfer(long nativePtr, String remotePeer, int op, long localIovPtr, long remoteIovPtr, String notificationMessage);
   private static native void nativeNotify(long nativePtr, String remotePeer, String message);
   private static native byte[] nativeGetPeerNotification(long nativePtr, String remotePeer);
+  private static native byte[] nativeWaitPeerNotification(long nativePtr, String remotePeer);
 
   private static native byte[] nativeMemTokenSerialize(long tokenPtr);
   private static native long nativeMemTokenGetAddress(long tokenPtr);
