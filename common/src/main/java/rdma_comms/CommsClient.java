@@ -248,9 +248,10 @@ public class CommsClient {
         out.writeByte(1);
         out.flush();
 
-        // 4. Allocate local buffer and register it (same size as server's buffer)
-        this.localBuffer = ByteBuffer.allocateDirect((int) remoteSize);
-        this.localToken = comms.regMem(localBuffer, remoteSize, CommsWrapper.MemoryType.Dram);
+        // 4. Allocate local buffer and natively map it (same size as server's buffer)
+        CommsWrapper.NativeBuffer nativeBuffer = comms.allocateAndRegMem(remoteSize, CommsWrapper.MemoryType.Dram);
+        this.localBuffer = nativeBuffer.buffer;
+        this.localToken = nativeBuffer.token;
         this.remoteToken = comms.getMemToken(remoteTokenOpaque);
         this.localBaseAddress = CommsWrapper.getDirectBufferAddress(localBuffer);
 
@@ -695,10 +696,10 @@ public class CommsClient {
     if (transferExecutor != null) {
       transferExecutor.shutdownNow();
     }
-    if (localToken != null) {
+    if (localToken != null && localBuffer != null) {
       try {
-        comms.deregMem(localToken);
-        logger.info("Local memory deregistered.");
+        comms.deregAndFreeMem(localBuffer, localToken);
+        logger.info("Local JNI-mapped memory deregistered and freed.");
       } catch (Exception e) {
         logger.error("Failed to deregister local memory", e);
       }

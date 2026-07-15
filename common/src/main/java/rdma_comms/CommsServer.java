@@ -214,16 +214,11 @@ public class CommsServer {
       logger.debug("comms.addRemoteEndpoint returned successfully.");
 
       // Allocate dedicated memory pool for this client
-      logger.info("Allocating {}MB RDMA buffer pool for client: {}...", poolSize / (1024 * 1024), clientPeerName);
-      ByteBuffer clientBuffer = ByteBuffer.allocateDirect(poolSize);
-      // Touch memory pages to avoid page faults during RDMA transfers
-      for (int i = 0; i < poolSize; i += 4096) {
-        clientBuffer.put(i, (byte) 0);
-      }
-
-      // Register the memory pool
-      CommsWrapper.MemToken clientToken = comms.regMem(clientBuffer, poolSize, CommsWrapper.MemoryType.Dram);
-      logger.info("Registered {}MB DRAM buffer pool for client: {}", poolSize / (1024 * 1024), clientPeerName);
+      logger.info("Allocating {}MB native RDMA buffer pool for client: {}...", poolSize / (1024 * 1024), clientPeerName);
+      CommsWrapper.NativeBuffer nativeBuffer = comms.allocateAndRegMem(poolSize, CommsWrapper.MemoryType.Dram);
+      ByteBuffer clientBuffer = nativeBuffer.buffer;
+      CommsWrapper.MemToken clientToken = nativeBuffer.token;
+      logger.info("Registered and mapped {}MB DRAM buffer pool for client: {}", poolSize / (1024 * 1024), clientPeerName);
 
       // Initialize Slot Pool (only use fetch slots for fetching)
       int pushBoundary = this.pushSlotsCount * this.pushSlotSize;
@@ -560,10 +555,10 @@ public class CommsServer {
         ctx.pollerThread.interrupt();
       }
 
-      if (ctx.localToken != null) {
+      if (ctx.localToken != null && ctx.localBuffer != null) {
       try {
-          comms.deregMem(ctx.localToken);
-          logger.info("Deregistered memory pool for client: {}", ctx.peerName);
+          comms.deregAndFreeMem(ctx.localBuffer, ctx.localToken);
+          logger.info("Deregistered and freed memory pool for client: {}", ctx.peerName);
       } catch (Exception e) {
           logger.error("Failed to deregister memory for client {}", ctx.peerName, e);
         }

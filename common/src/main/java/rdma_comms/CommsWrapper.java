@@ -135,6 +135,25 @@ public class CommsWrapper implements AutoCloseable {
     }
   }
 
+  public static class NativeBuffer {
+      public final ByteBuffer buffer;
+      public final MemToken token;
+      public NativeBuffer(ByteBuffer buffer, MemToken token) {
+          this.buffer = buffer; this.token = token;
+      }
+  }
+
+  public NativeBuffer allocateAndRegMem(long size, MemoryType memType) {
+      long[] tokenPtrOut = new long[1];
+      ByteBuffer buf = nativeAllocateAndRegMem(nativePtr, size, memType.ordinal(), tokenPtrOut);
+      return new NativeBuffer(buf, new MemToken(tokenPtrOut[0]));
+  }
+  
+  public synchronized void deregAndFreeMem(ByteBuffer buffer, MemToken token) {
+      nativeDeregAndFreeMem(nativePtr, buffer, token.getNativePtr());
+      token.close();
+  }
+
   /**
    * Deserializes a remote memory token from opaque bytes.
    * Equivalent to 'absl::StatusOr<unique_ptr<MemToken>> comms::Comms::GetMemToken(const opaque_data_t&)'.
@@ -393,6 +412,8 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeConnect(long nativePtr, String peerName);
   private static native long nativeRegMem(long nativePtr, ByteBuffer buffer, long size, int memoryType);
   private static native void nativeDeregMem(long nativePtr, long memTokenPtr);
+  private static native ByteBuffer nativeAllocateAndRegMem(long nativePtr, long size, int memoryType, long[] tokenPtrOut);
+  private static native void nativeDeregAndFreeMem(long nativePtr, ByteBuffer buffer, long memTokenPtr);
   private static native long nativeGetMemToken(long nativePtr, byte[] serTok);
   private static native long nativePostTransfer(long nativePtr, String remotePeer, int op, long localIovPtr, long remoteIovPtr, String notificationMessage);
   private static native void nativeNotify(long nativePtr, String remotePeer, String message);
