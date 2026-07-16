@@ -3,19 +3,22 @@ package rdma_comms;
 import java.nio.ByteBuffer;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import io.netty.buffer.ByteBuf;
+import org.apache.celeborn.common.network.buffer.ManagedBuffer;
+import org.apache.celeborn.common.network.buffer.NettyManagedBuffer;
+import org.apache.celeborn.common.network.client.ChunkReceivedCallback;
+import org.apache.celeborn.common.network.client.RpcResponseCallback;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-/**
- * Main entry point for the communication library.
- * Equivalent to C++ class 'comms::Comms' in 'comms/comms.h'.
- */
 public class CommsWrapper implements AutoCloseable {
+  private static final Logger logger = LoggerFactory.getLogger(CommsWrapper.class);
+
   static {
     try {
-      // Extract and load native libraries directly from JAR resources
       java.io.File tempDir = createTempDir();
       java.io.File coreLib = extractResource(tempDir, "/natives/libml_transport.so");
       java.io.File jniLib = extractResource(tempDir, "/natives/libml_transport_jni.so");
-      
       System.load(coreLib.getAbsolutePath());
       System.load(jniLib.getAbsolutePath());
     } catch (Exception ex) {
@@ -24,447 +27,261 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   public static volatile boolean RDMA_TRACKER_ENABLED = true;
+  private static final Map<Long, CommsWrapper> activeWrappers = new ConcurrentHashMap<>();
 
-  // Holds the raw pointer to the C++ comms::Comms object.
   private final long nativePtr;
+  private ByteBuffer localBuffer;
+  private Map<String, ByteBuffer> serverClientBuffers = new ConcurrentHashMap<>();
+  public ServerJniHandler serverHandler;
 
-
-  /**
-   * Constructor. Creates the underlying C++ Comms object.
-   * Equivalent to 'comms::Comms::Comms()'.
-   */
   public CommsWrapper() {
     this.nativePtr = nativeCreate();
+    activeWrappers.put(this.nativePtr, this);
   }
 
   public synchronized void init(Map<String, String> params) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      if (params.containsKey("AP_RDMA_TRACKER_ENABLED")) {
-        RDMA_TRACKER_ENABLED = Boolean.parseBoolean(params.get("AP_RDMA_TRACKER_ENABLED"));
-      }
-      nativeInit(nativePtr, params);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.INIT, System.nanoTime() - t0);
-      }
+    if (params.containsKey("AP_RDMA_TRACKER_ENABLED")) {
+      RDMA_TRACKER_ENABLED = Boolean.parseBoolean(params.get("AP_RDMA_TRACKER_ENABLED"));
     }
+    nativeInit(nativePtr, params);
   }
 
-  /**
-   * Retrieves serialized connection handle of the local instance (opaque bytes).
-   * Equivalent to 'absl::StatusOr<size_t> comms::Comms::GetEndpointInfo(opaque_data_t& data)'.
-   */
   public synchronized byte[] getEndpointInfo() {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      return nativeGetEndpointInfo(nativePtr);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.GET_ENDPOINT_INFO, System.nanoTime() - t0);
-      }
-    }
+    return nativeGetEndpointInfo(nativePtr);
   }
 
-  /**
-   * Adds a remote endpoint using its opaque handle bytes and connects to it.
-   * Internally converts opaque bytes to ConnHandle and uses default ConnConfig in C++ JNI layer.
-   * 
-   * @param peerName Name of the remote peer.
-   * @param opaqueHandleBytes Handle bytes received from the remote peer.
-   * @param block If true, blocks until the connection is established.
-   */
   public void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.ADD_REMOTE_ENDPOINT, System.nanoTime() - t0);
-      }
-    }
+    nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
   }
 
-  /**
-   * Explicitly connects to a remote peer.
-   * Equivalent to 'absl::Status comms::Comms::Connect(const std::string&)'.
-   */
   public void connect(String peerName) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      nativeConnect(nativePtr, peerName);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.CONNECT, System.nanoTime() - t0);
-      }
+    nativeConnect(nativePtr, peerName);
+  }
+
+  public NativeBuffer allocateAndRegMem(long size, MemoryType memType) {
+    long[] tokenPtrOut = new long[1];
+    ByteBuffer buf = nativeAllocateAndRegMem(nativePtr, size, memType.ordinal(), tokenPtrOut);
+    return new NativeBuffer(buf, new MemToken(tokenPtrOut[0]));
+  }
+  
+  public synchronized void deregAndFreeMem(ByteBuffer buffer, MemToken token) {
+    nativeDeregAndFreeMem(nativePtr, buffer, token.getNativePtr());
+    token.close();
+  }
+
+  public synchronized MemToken getMemToken(byte[] serTok) {
+    long tokenPtr = nativeGetMemToken(nativePtr, serTok);
+    return new MemToken(tokenPtr);
+  }
+
+  // --- Client API ---
+  public void initClientPool(int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, ByteBuffer localBuffer, MemToken localToken, MemToken remoteToken, String serverPeerName) {
+    this.localBuffer = localBuffer;
+    nativeInitClientPool(nativePtr, serverPeerName, pushSlots, pushSlotSize, fetchSlots, fetchSlotSize, localToken.getNativePtr(), remoteToken.getNativePtr());
+  }
+
+  public void fetchChunk(String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback) {
+    nativeFetchChunk(nativePtr, remotePeer, streamId, chunkIndex, callback);
+  }
+
+  public void pushData(String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+    nativePushData(nativePtr, remotePeer, body, shuffleKey, partitionUniqueId, callback);
+  }
+
+  public void pushMergedData(String remotePeer, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+    String pIds = String.join(",", partitionUniqueIds);
+    String offs = java.util.Arrays.stream(offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+    nativePushMergedData(nativePtr, remotePeer, body, shuffleKey, pIds, offs, callback);
+  }
+
+  // --- Server API ---
+  public interface ServerJniHandler {
+    void onFetchRequest(String clientPeer, long streamId, int chunkIndex, int slotOffset);
+    void onPushData(String clientPeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId);
+    void onPushMergedData(String clientPeer, int slotOffset, int length, String shuffleKey, String payload);
+  }
+
+  public void setServerHandler(ServerJniHandler handler) {
+    this.serverHandler = handler;
+  }
+
+  public void initServerClientPool(String clientPeer, ByteBuffer clientBuffer) {
+    this.serverClientBuffers.put(clientPeer, clientBuffer); // Note: server maintains pool per client locally in ServerContext if needed
+    nativeInitServerClientPool(nativePtr, clientPeer);
+  }
+
+  public void serverChunkReady(String clientPeer, long streamId, int chunkIndex, int length, int slotOffset) {
+    nativeServerChunkReady(nativePtr, clientPeer, streamId, chunkIndex, length, slotOffset);
+  }
+
+  public void serverPushComplete(String clientPeer, int slotOffset, byte statusCode) {
+    nativeServerPushComplete(nativePtr, clientPeer, slotOffset, statusCode);
+  }
+
+  public void serverPushFailed(String clientPeer, int slotOffset, String errorMsg) {
+    nativeServerPushFailed(nativePtr, clientPeer, slotOffset, errorMsg);
+  }
+
+  // --- Support ---
+  public ByteBuffer getLocalBufferSlice(int slotOffset, int length) {
+    return getLocalBufferSlice(null, slotOffset, length);
+  }
+
+  public ByteBuffer getLocalBufferSlice(String clientPeer, int slotOffset, int length) {
+    ByteBuffer slice;
+    ByteBuffer buf = (clientPeer != null && serverClientBuffers.containsKey(clientPeer)) 
+                     ? serverClientBuffers.get(clientPeer) 
+                     : this.localBuffer;
+    synchronized (buf) {
+      ByteBuffer dup = buf.duplicate();
+      dup.position(slotOffset);
+      dup.limit(slotOffset + length);
+      slice = dup.slice();
+    }
+    return slice;
+  }
+
+  public void releaseClientSlot(int slotOffset) {
+    nativeReleaseSlot(nativePtr, slotOffset);
+  }
+
+  // --- Static Upcall Dispatchers (called from C++) ---
+  private static CommsWrapper getWrapper(long ptr) { return activeWrappers.get(ptr); }
+
+  public static void dispatchClientFetchSuccess(long nativePtr, int chunkIndex, ChunkReceivedCallback callback, int length, int slotOffset) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      ByteBuffer sliced = wrapper.getLocalBufferSlice(slotOffset, length);
+      ByteBuf customBuf = new CustomRDMAByteBuf(
+          io.netty.buffer.UnpooledByteBufAllocator.DEFAULT,
+          sliced,
+          length,
+          () -> wrapper.releaseClientSlot(slotOffset)
+      );
+      ManagedBuffer managedBuffer = new NettyManagedBuffer(customBuf);
+      callback.onSuccess(chunkIndex, managedBuffer);
+      managedBuffer.release();
     }
   }
 
-  /**
-   * Registers a local direct ByteBuffer.
-   * Equivalent to 'absl::StatusOr<unique_ptr<MemToken>> comms::Comms::RegMem(...)'.
-   */
-  public synchronized MemToken regMem(ByteBuffer buffer, long size, MemoryType type) {
-    if (!buffer.isDirect()) {
-      throw new IllegalArgumentException("Buffer must be direct");
-    }
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      long tokenPtr = nativeRegMem(nativePtr, buffer, size, type.ordinal());
-      return new MemToken(tokenPtr);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.REG_MEM, System.nanoTime() - t0);
-      }
+  public static void dispatchClientFetchFailed(long nativePtr, int chunkIndex, ChunkReceivedCallback callback, String errorMsg, int slotOffset) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      callback.onFailure(chunkIndex, new java.io.IOException("RDMA fetch failed: " + errorMsg));
+      wrapper.releaseClientSlot(slotOffset);
     }
   }
 
-  /**
-   * Deregisters a local memory token and closes it.
-   * Equivalent to 'absl::Status comms::Comms::DeregMem(MemToken&)'
-   */
-  public synchronized void deregMem(MemToken token) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      nativeDeregMem(nativePtr, token.getNativePtr());
-      token.close(); 
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.DEREG_MEM, System.nanoTime() - t0);
-      }
+  public static void dispatchClientPushComplete(long nativePtr, RpcResponseCallback callback, byte statusCode, int slotOffset) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      callback.onSuccess(ByteBuffer.wrap(new byte[]{statusCode}));
+      wrapper.releaseClientSlot(slotOffset);
     }
   }
+
+  public static void dispatchClientPushFailed(long nativePtr, RpcResponseCallback callback, String errorMsg, int slotOffset) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      callback.onFailure(new java.io.IOException("RDMA push failed: " + errorMsg));
+      wrapper.releaseClientSlot(slotOffset);
+    }
+  }
+
+  public static void dispatchServerFetchRequest(long nativePtr, String clientPeer, long streamId, int chunkIndex, int slotOffset) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null && wrapper.serverHandler != null) {
+      wrapper.serverHandler.onFetchRequest(clientPeer, streamId, chunkIndex, slotOffset);
+    }
+  }
+
+  public static void dispatchServerPushData(long nativePtr, String clientPeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null && wrapper.serverHandler != null) {
+      wrapper.serverHandler.onPushData(clientPeer, slotOffset, length, shuffleKey, partitionUniqueId);
+    }
+  }
+
+  public static void dispatchServerPushMergedData(long nativePtr, String clientPeer, int slotOffset, int length, String shuffleKey, String payload) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null && wrapper.serverHandler != null) {
+      wrapper.serverHandler.onPushMergedData(clientPeer, slotOffset, length, shuffleKey, payload);
+    }
+  }
+
+  @Override
+  public synchronized void close() {
+    activeWrappers.remove(nativePtr);
+    nativeDestroy(nativePtr);
+  }
+
+  public static native long getDirectBufferAddress(ByteBuffer buf);
+
+  // Nested Types
+  public enum MemoryType { Dram, Vram }
 
   public static class NativeBuffer {
       public final ByteBuffer buffer;
       public final MemToken token;
-      public NativeBuffer(ByteBuffer buffer, MemToken token) {
-          this.buffer = buffer; this.token = token;
-      }
-  }
-
-  public NativeBuffer allocateAndRegMem(long size, MemoryType memType) {
-      long[] tokenPtrOut = new long[1];
-      ByteBuffer buf = nativeAllocateAndRegMem(nativePtr, size, memType.ordinal(), tokenPtrOut);
-      return new NativeBuffer(buf, new MemToken(tokenPtrOut[0]));
-  }
-  
-  public synchronized void deregAndFreeMem(ByteBuffer buffer, MemToken token) {
-      nativeDeregAndFreeMem(nativePtr, buffer, token.getNativePtr());
-      token.close();
-  }
-
-  /**
-   * Deserializes a remote memory token from opaque bytes.
-   * Equivalent to 'absl::StatusOr<unique_ptr<MemToken>> comms::Comms::GetMemToken(const opaque_data_t&)'.
-   */
-  public synchronized MemToken getMemToken(byte[] serTok) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      long tokenPtr = nativeGetMemToken(nativePtr, serTok);
-      return new MemToken(tokenPtr);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.GET_MEM_TOKEN, System.nanoTime() - t0);
-      }
-    }
-  }
-
-  /**
-   * Posts an asynchronous transfer operation.
-   * Equivalent to 'absl::StatusOr<unique_ptr<Request>> comms::Comms::PostTransfer(...)'.
-   */
-  public Request postTransfer(String remotePeer, TransferOpType op, TransferIov local, TransferIov remote, String notificationMessage) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      long reqPtr = nativePostTransfer(nativePtr, remotePeer, op.ordinal(), local.getNativePtr(), remote.getNativePtr(), notificationMessage);
-      return new Request(reqPtr);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
-      }
-    }
-  }
-
-  /**
-   * Pushes data directly and sends the notification asynchronously, handled entirely by C++.
-   *
-   * @param remotePeer remote peer name
-   * @param localAddr local memory address (must be registered)
-   * @param remoteAddr remote destination address
-   * @param length length of data
-   * @param localToken local mem token
-   * @param remoteToken remote mem token
-   * @param notificationMessage notification message
-   */
-  public void asyncPush(String remotePeer, long localAddr, long remoteAddr, long length, MemToken localToken, MemToken remoteToken, String notificationMessage) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      nativeAsyncPush(nativePtr, remotePeer, localAddr, remoteAddr, length, localToken.getNativePtr(), remoteToken.getNativePtr(), notificationMessage);
-    } finally {
-        if (RDMA_TRACKER_ENABLED) {
-            // Just reuse POST_TRANSFER tracker type for now
-            RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
-        }
-    }
-  }
-
-  public void asyncFetch(String remotePeer, long localAddr, long remoteAddr, long length, MemToken localToken, MemToken remoteToken, String notificationMessage) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      nativeAsyncFetch(nativePtr, remotePeer, localAddr, remoteAddr, length, localToken.getNativePtr(), remoteToken.getNativePtr(), notificationMessage);
-    } finally {
-        if (RDMA_TRACKER_ENABLED) {
-            RDMATracker.record(RDMATracker.CallType.POST_TRANSFER, System.nanoTime() - t0);
-        }
-    }
-  }
-
-  /**
-   * Sends a standalone notification message.
-   * Equivalent to 'absl::Status comms::Comms::Notify(const std::string&, const std::string&)'.
-   */
-  public void notify(String remotePeer, String message) {
-    long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-    try {
-      nativeNotify(nativePtr, remotePeer, message);
-    } finally {
-      if (RDMA_TRACKER_ENABLED) {
-        RDMATracker.record(RDMATracker.CallType.NOTIFY, System.nanoTime() - t0);
-      }
-    }
-  }
-
-
-  public interface NotificationListener {
-    void onPeerNotification(String remotePeer, byte[] message);
-  }
-
-  private static final Map<Long, NotificationListener> listeners = new ConcurrentHashMap<>();
-
-  public void setNotificationListener(NotificationListener listener) {
-    listeners.put(this.nativePtr, listener);
-  }
-
-  /**
-   * Called by the C++ DispatcherLoop thread via JNI.
-   */
-  public static void dispatchPeerNotification(long nativePtr, String remotePeer, byte[] messageBytes) {
-    NotificationListener listener = listeners.get(nativePtr);
-    if (listener != null) {
-      listener.onPeerNotification(remotePeer, messageBytes);
-    }
-  }
-
-  /**
-   * Destructor. Frees the underlying C++ Comms object.
-   * Equivalent to 'comms::Comms::~Comms()'.
-   */
-  /**
-   * Destructor. Frees the underlying C++ Comms object.
-   * Equivalent to 'comms::Comms::~Comms()'.
-   */
-  @Override
-  public synchronized void close() {
-    listeners.remove(nativePtr);
-    nativeDestroy(nativePtr);
-  }
-
-  /**
-   * JNI Helper to get the native memory address of a direct ByteBuffer.
-   */
-  public static native long getDirectBufferAddress(ByteBuffer buf);
-
-  // =========================================================================
-  // Nested Types
-  // =========================================================================
-
-  public enum MemoryType { Dram, Vram }
-  public enum TransferOpType { Read, Write }
-  public enum State { Unstarted, InProgress, Done, Error }
-
-  public static class TransferStatus {
-    public final State state;
-    public final long bytesTransferred;
-
-    public TransferStatus(State state, long bytesTransferred) {
-      this.state = state;
-      this.bytesTransferred = bytesTransferred;
-    }
-  }
-
-  public static class CommsException extends RuntimeException {
-    public CommsException(String message) { super(message); }
+      public NativeBuffer(ByteBuffer buffer, MemToken token) { this.buffer = buffer; this.token = token; }
   }
 
   public static class MemToken implements AutoCloseable {
     private long nativePtr;
     MemToken(long nativePtr) { this.nativePtr = nativePtr; }
     long getNativePtr() { return nativePtr; }
-
-    public byte[] serialize() {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      return nativeMemTokenSerialize(nativePtr);
-    }
-    public long getAddress() {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      return nativeMemTokenGetAddress(nativePtr);
-    }
-    public long getSize() {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      return nativeMemTokenGetSize(nativePtr);
-    }
-    @Override
-    public void close() {
-      if (nativePtr != 0) {
-        nativeMemTokenDelete(nativePtr);
-        nativePtr = 0;
-      }
+    public byte[] serialize() { return nativeMemTokenSerialize(nativePtr); }
+    public long getAddress() { return nativeMemTokenGetAddress(nativePtr); }
+    public long getSize() { return nativeMemTokenGetSize(nativePtr); }
+    @Override public void close() {
+      if (nativePtr != 0) { nativeMemTokenDelete(nativePtr); nativePtr = 0; }
     }
   }
 
-  public static class TransferIov implements AutoCloseable {
-    private long nativePtr;
-    public TransferIov(boolean remote) { this.nativePtr = nativeTransferIovCreate(remote); }
-    long getNativePtr() { return nativePtr; }
-
-    public void addSegment(long addr, long size, MemToken token) {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      nativeTransferIovAddSegment(nativePtr, addr, size, token.getNativePtr());
-    }
-    @Override
-    public void close() {
-      if (nativePtr != 0) {
-        nativeTransferIovDestroy(nativePtr);
-        nativePtr = 0;
-      }
-    }
-  }
-
-  public static class Request implements AutoCloseable {
-    private static final State[] CACHED_STATES = State.values();
-    private final long[] scratchStats = new long[1];
-    private long nativePtr;
-
-    Request(long nativePtr) { 
-      this.nativePtr = nativePtr; 
-    }
-    long getNativePtr() { return nativePtr; }
-
-    public boolean isInProgress() {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-      try {
-        int state = nativeRequestGetStatus(nativePtr, scratchStats);
-        return CACHED_STATES[state] == State.InProgress;
-      } finally {
-        if (RDMA_TRACKER_ENABLED) {
-          RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
-        }
-      }
-    }
-
-    public TransferStatus getStatus() {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-      try {
-        int state = nativeRequestGetStatus(nativePtr, scratchStats);
-        return new TransferStatus(CACHED_STATES[state], scratchStats[0]);
-      } finally {
-        if (RDMA_TRACKER_ENABLED) {
-          RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
-        }
-      }
-    }
-
-    public TransferStatus waitCompletion() {
-      if (nativePtr == 0) throw new IllegalStateException("Closed");
-      long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-      try {
-        int state = nativeRequestWait(nativePtr, scratchStats);
-        return new TransferStatus(CACHED_STATES[state], scratchStats[0]);
-      } finally {
-        if (RDMA_TRACKER_ENABLED) {
-          // Re-use REQUEST_GET_STATUS tracker since we are waiting for status
-          RDMATracker.record(RDMATracker.CallType.REQUEST_GET_STATUS, System.nanoTime() - t0);
-        }
-      }
-    }
-
-    @Override
-    public void close() {
-      if (nativePtr != 0) {
-        long t0 = RDMA_TRACKER_ENABLED ? System.nanoTime() : 0;
-        try {
-          nativeRequestDestroy(nativePtr);
-        } finally {
-          if (RDMA_TRACKER_ENABLED) {
-            RDMATracker.record(RDMATracker.CallType.REQUEST_DESTROY, System.nanoTime() - t0);
-          }
-        }
-        nativePtr = 0;
-      }
-    }
-  }
-
-  // =========================================================================
-  // JNI Native Declarations
-  // =========================================================================
-
+  // --- Native Declarations ---
   private static native long nativeCreate();
   private static native void nativeDestroy(long nativePtr);
   private static native void nativeInit(long nativePtr, Map<String, String> params);
   private static native byte[] nativeGetEndpointInfo(long nativePtr);
   private static native void nativeAddRemoteEndpoint(long nativePtr, String peerName, byte[] opaqueHandleBytes, boolean block);
   private static native void nativeConnect(long nativePtr, String peerName);
-  private static native long nativeRegMem(long nativePtr, ByteBuffer buffer, long size, int memoryType);
-  private static native void nativeDeregMem(long nativePtr, long memTokenPtr);
   private static native ByteBuffer nativeAllocateAndRegMem(long nativePtr, long size, int memoryType, long[] tokenPtrOut);
   private static native void nativeDeregAndFreeMem(long nativePtr, ByteBuffer buffer, long memTokenPtr);
   private static native long nativeGetMemToken(long nativePtr, byte[] serTok);
-  private static native long nativePostTransfer(long nativePtr, String remotePeer, int op, long localIovPtr, long remoteIovPtr, String notificationMessage);
-  private static native void nativeAsyncPush(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
-  private static native void nativeAsyncFetch(long nativePtr, String remotePeer, long localAddr, long remoteAddr, long length, long localTokenPtr, long remoteTokenPtr, String notificationMessage);
-  private static native void nativeNotify(long nativePtr, String remotePeer, String message);
+
+  private static native void nativeInitClientPool(long nativePtr, String peerName, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, long localTokenPtr, long remoteTokenPtr);
+  private static native void nativeFetchChunk(long nativePtr, String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback);
+  private static native void nativePushData(long nativePtr, String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback);
+  private static native void nativePushMergedData(long nativePtr, String remotePeer, byte[] body, String shuffleKey, String partitionIds, String offsets, RpcResponseCallback callback);
+  private static native void nativeReleaseSlot(long nativePtr, int slotOffset);
+  
+  private static native void nativeInitServerClientPool(long nativePtr, String clientPeer);
+  private static native void nativeServerChunkReady(long nativePtr, String clientPeer, long streamId, int chunkIndex, int length, int slotOffset);
+  private static native void nativeServerPushComplete(long nativePtr, String clientPeer, int slotOffset, byte statusCode);
+  private static native void nativeServerPushFailed(long nativePtr, String clientPeer, int slotOffset, String errorMsg);
 
   private static native byte[] nativeMemTokenSerialize(long tokenPtr);
   private static native long nativeMemTokenGetAddress(long tokenPtr);
   private static native long nativeMemTokenGetSize(long tokenPtr);
   private static native void nativeMemTokenDelete(long tokenPtr);
 
-  private static native long nativeTransferIovCreate(boolean remote);
-  private static native void nativeTransferIovDestroy(long iovPtr);
-  private static native void nativeTransferIovAddSegment(long iovPtr, long addr, long size, long tokenPtr);
-
-  private static native int nativeRequestGetStatus(long reqPtr, long[] stats);
-  private static native int nativeRequestWait(long reqPtr, long[] stats);
-  private static native void nativeRequestDestroy(long reqPtr);
-
   private static java.io.File createTempDir() throws java.io.IOException {
     java.io.File tempDir = java.io.File.createTempFile("ml_transport_natives-", "");
-    if (!tempDir.delete() || !tempDir.mkdir()) {
-      throw new java.io.IOException("Failed to create temp directory: " + tempDir.getAbsolutePath());
-    }
+    if (!tempDir.delete() || !tempDir.mkdir()) throw new java.io.IOException("Failed to create temp directory");
     tempDir.deleteOnExit();
     return tempDir;
   }
 
   private static java.io.File extractResource(java.io.File destDir, String resourcePath) throws java.io.IOException {
     java.io.InputStream in = CommsWrapper.class.getResourceAsStream(resourcePath);
-    if (in == null) {
-      throw new java.io.FileNotFoundException("Resource not found in JAR: " + resourcePath);
-    }
-    
+    if (in == null) throw new java.io.FileNotFoundException("Resource not found in JAR: " + resourcePath);
     String filename = resourcePath.substring(resourcePath.lastIndexOf('/') + 1);
     java.io.File destFile = new java.io.File(destDir, filename);
     destFile.deleteOnExit();
-    
     try (java.io.FileOutputStream out = new java.io.FileOutputStream(destFile)) {
       byte[] buffer = new byte[8192];
       int read;
-      while ((read = in.read(buffer)) != -1) {
-        out.write(buffer, 0, read);
-      }
+      while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
     }
     return destFile;
   }
