@@ -47,7 +47,7 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
   private java.util.concurrent.ExecutorService registerExecutor;
 
   public CommsServer(String transportType, String localPeerName, String localIp, 
-                     int bootstrapPort, int bufferSize, int oobPort, boolean testMode,
+                     int bootstrapPort, int bufferSize, int oobPort,
                      int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;

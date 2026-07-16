@@ -39,11 +39,7 @@ public class CommsClient {
               conf.rdmaPushSlotsCount(),
               conf.rdmaFetchSlotsCount(),
               (int) conf.rdmaPushSlotSize(),
-              (int) conf.rdmaFetchSlotSize(),
-              conf.rdmaWriteBatchSize(),
-              conf.rdmaWriteBatchLingerMs(),
-              conf.rdmaReadBatchSize(),
-              conf.rdmaReadBatchLingerMs()
+              (int) conf.rdmaFetchSlotSize()
           );
           client.rdmaTrackerEnabled = conf.rdmaTrackerEnabled();
           client.setup();
@@ -79,8 +75,7 @@ public class CommsClient {
 
   public CommsClient(String transportType, String localPeerName, String localIp, String serverIp, 
                 int oobPort, String serverPeerName, int slotSize,
-                int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize,
-                int writeBatchSize, long writeLingerMs, int readBatchSize, long readLingerMs) {
+                int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;
     this.localIp = (localIp == null || localIp.isEmpty()) ? org.apache.celeborn.common.util.JavaUtils.getLocalHost() : localIp;

@@ -104,7 +104,6 @@ private[celeborn] class Worker(
       conf.rdmaBootstrapPort,
       if (conf.rdmaBufferSize > 0) conf.rdmaBufferSize.toInt else conf.shuffleChunkSize.toInt,
       conf.rdmaOobPort,
-      conf.rdmaTestJni,
       conf.rdmaPushSlotsCount,
       conf.rdmaFetchSlotsCount,
       conf.rdmaPushSlotSize.toInt,
