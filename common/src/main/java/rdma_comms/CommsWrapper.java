@@ -85,13 +85,23 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   public void pushData(String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
-    nativePushData(nativePtr, remotePeer, body, shuffleKey, partitionUniqueId, callback);
+    int slotOffset = nativeAcquirePushSlot(nativePtr);
+    ByteBuffer slice = localBuffer.slice();
+    slice.position(slotOffset);
+    slice.put(body);
+    nativePushData(nativePtr, remotePeer, slotOffset, body.length, shuffleKey, partitionUniqueId, callback);
   }
 
   public void pushMergedData(String remotePeer, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
     String pIds = String.join(",", partitionUniqueIds);
     String offs = java.util.Arrays.stream(offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
-    nativePushMergedData(nativePtr, remotePeer, body, shuffleKey, pIds, offs, callback);
+    
+    int slotOffset = nativeAcquirePushSlot(nativePtr);
+    ByteBuffer slice = localBuffer.slice();
+    slice.position(slotOffset);
+    slice.put(body);
+    
+    nativePushMergedData(nativePtr, remotePeer, slotOffset, body.length, shuffleKey, pIds, offs, callback);
   }
 
   // --- Server API ---
@@ -251,8 +261,9 @@ public class CommsWrapper implements AutoCloseable {
 
   private static native void nativeInitClientPool(long nativePtr, String peerName, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, long localTokenPtr, long remoteTokenPtr);
   private static native void nativeFetchChunk(long nativePtr, String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback);
-  private static native void nativePushData(long nativePtr, String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback);
-  private static native void nativePushMergedData(long nativePtr, String remotePeer, byte[] body, String shuffleKey, String partitionIds, String offsets, RpcResponseCallback callback);
+  private static native int nativeAcquirePushSlot(long nativePtr);
+  private static native void nativePushData(long nativePtr, String remotePeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback);
+  private static native void nativePushMergedData(long nativePtr, String remotePeer, int slotOffset, int length, String shuffleKey, String partitionIds, String offsets, RpcResponseCallback callback);
   private static native void nativeReleaseSlot(long nativePtr, int slotOffset);
   
   private static native void nativeInitServerClientPool(long nativePtr, String clientPeer);
