@@ -84,31 +84,61 @@ public class CommsWrapper implements AutoCloseable {
     nativeFetchChunk(nativePtr, remotePeer, streamId, chunkIndex, callback);
   }
 
+  private byte[] encodePushDataPayload(String shuffleKey, String partitionUniqueId) {
+    byte[] keyBytes = shuffleKey.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[] pidBytes = partitionUniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    ByteBuffer buf = ByteBuffer.allocate(8 + keyBytes.length + pidBytes.length);
+    buf.putInt(keyBytes.length);
+    buf.put(keyBytes);
+    buf.putInt(pidBytes.length);
+    buf.put(pidBytes);
+    return buf.array();
+  }
+
+  private byte[] encodePushMergedPayload(String shuffleKey, String[] partitionUniqueIds, int[] offsets) {
+    byte[] keyBytes = shuffleKey.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    byte[][] pidBytes = new byte[partitionUniqueIds.length][];
+    int len = 8 + keyBytes.length + 8;
+    for (int i = 0; i < partitionUniqueIds.length; i++) {
+        pidBytes[i] = partitionUniqueIds[i].getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        len += 4 + pidBytes[i].length + 4;
+    }
+    ByteBuffer buf = ByteBuffer.allocate(len);
+    buf.putInt(keyBytes.length);
+    buf.put(keyBytes);
+    buf.putInt(partitionUniqueIds.length);
+    for (byte[] pBytes : pidBytes) {
+        buf.putInt(pBytes.length);
+        buf.put(pBytes);
+    }
+    buf.putInt(offsets.length);
+    for (int offset : offsets) buf.putInt(offset);
+    return buf.array();
+  }
+
   public void pushData(String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
     int slotOffset = nativeAcquirePushSlot(nativePtr);
     ByteBuffer slice = localBuffer.slice();
     slice.position(slotOffset);
     slice.put(body);
-    nativePushData(nativePtr, remotePeer, slotOffset, body.length, shuffleKey, partitionUniqueId, callback);
+    byte[] payload = encodePushDataPayload(shuffleKey, partitionUniqueId);
+    nativePushData(nativePtr, remotePeer, slotOffset, body.length, payload, callback);
   }
 
   public void pushMergedData(String remotePeer, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
-    String pIds = String.join(",", partitionUniqueIds);
-    String offs = java.util.Arrays.stream(offsets).mapToObj(String::valueOf).collect(java.util.stream.Collectors.joining(","));
-    
     int slotOffset = nativeAcquirePushSlot(nativePtr);
     ByteBuffer slice = localBuffer.slice();
     slice.position(slotOffset);
     slice.put(body);
-    
-    nativePushMergedData(nativePtr, remotePeer, slotOffset, body.length, shuffleKey, pIds, offs, callback);
+    byte[] payload = encodePushMergedPayload(shuffleKey, partitionUniqueIds, offsets);
+    nativePushMergedData(nativePtr, remotePeer, slotOffset, body.length, payload, callback);
   }
 
   // --- Server API ---
   public interface ServerJniHandler {
     void onFetchRequest(String clientPeer, long streamId, int chunkIndex, int slotOffset);
-    void onPushData(String clientPeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId);
-    void onPushMergedData(String clientPeer, int slotOffset, int length, String shuffleKey, String payload);
+    void onPushData(String clientPeer, int slotOffset, int length, byte[] payload);
+    void onPushMergedData(String clientPeer, int slotOffset, int length, byte[] payload);
   }
 
   public void setServerHandler(ServerJniHandler handler) {
@@ -205,17 +235,17 @@ public class CommsWrapper implements AutoCloseable {
     }
   }
 
-  public static void dispatchServerPushData(long nativePtr, String clientPeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId) {
+  public static void dispatchServerPushData(long nativePtr, String clientPeer, int slotOffset, int length, byte[] payload) {
     CommsWrapper wrapper = getWrapper(nativePtr);
     if (wrapper != null && wrapper.serverHandler != null) {
-      wrapper.serverHandler.onPushData(clientPeer, slotOffset, length, shuffleKey, partitionUniqueId);
+      wrapper.serverHandler.onPushData(clientPeer, slotOffset, length, payload);
     }
   }
 
-  public static void dispatchServerPushMergedData(long nativePtr, String clientPeer, int slotOffset, int length, String shuffleKey, String payload) {
+  public static void dispatchServerPushMergedData(long nativePtr, String clientPeer, int slotOffset, int length, byte[] payload) {
     CommsWrapper wrapper = getWrapper(nativePtr);
     if (wrapper != null && wrapper.serverHandler != null) {
-      wrapper.serverHandler.onPushMergedData(clientPeer, slotOffset, length, shuffleKey, payload);
+      wrapper.serverHandler.onPushMergedData(clientPeer, slotOffset, length, payload);
     }
   }
 
@@ -262,8 +292,8 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeInitClientPool(long nativePtr, String peerName, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, long localTokenPtr, long remoteTokenPtr);
   private static native void nativeFetchChunk(long nativePtr, String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback);
   private static native int nativeAcquirePushSlot(long nativePtr);
-  private static native void nativePushData(long nativePtr, String remotePeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback);
-  private static native void nativePushMergedData(long nativePtr, String remotePeer, int slotOffset, int length, String shuffleKey, String partitionIds, String offsets, RpcResponseCallback callback);
+  private static native void nativePushData(long nativePtr, String remotePeer, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
+  private static native void nativePushMergedData(long nativePtr, String remotePeer, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
   private static native void nativeReleaseSlot(long nativePtr, int slotOffset);
   
   private static native void nativeInitServerClientPool(long nativePtr, String clientPeer);

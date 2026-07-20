@@ -169,60 +169,99 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
   }
 
   @Override
-  public void onPushData(String clientPeer, int slotOffset, int length, String shuffleKey, String partitionUniqueId) {
+  public void onPushData(String clientPeer, int slotOffset, int length, byte[] payload) {
     if (chunkPushHandler == null) return;
-    fetchExecutor.submit(() -> {
-      try {
-        ByteBuffer slice = comms.getLocalBufferSlice(clientPeer, slotOffset, length);
-        ByteBuf body = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(length);
-        body.writeBytes(slice);
-        
-        chunkPushHandler.pushData(shuffleKey, partitionUniqueId, body, new RpcResponseCallback() {
-          @Override
-          public void onSuccess(ByteBuffer response) {
-            byte statusCode = (response != null && response.remaining() > 0) ? response.get(response.position()) : 0;
-            comms.serverPushComplete(clientPeer, slotOffset, statusCode);
-          }
-          @Override
-          public void onFailure(Throwable e) {
-            comms.serverPushFailed(clientPeer, slotOffset, e.getMessage());
-          }
-        });
-        body.release();
-      } catch (Throwable t) {
-        comms.serverPushFailed(clientPeer, slotOffset, t.getMessage());
-      }
-    });
+    long t0 = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
+      fetchExecutor.submit(() -> {
+        try {
+          ByteBuffer buf = ByteBuffer.wrap(payload);
+          int keyLen = buf.getInt();
+          byte[] keyBytes = new byte[keyLen];
+          buf.get(keyBytes);
+          String shuffleKey = new String(keyBytes, java.nio.charset.StandardCharsets.UTF_8);
+          
+          int pidLen = buf.getInt();
+          byte[] pidBytes = new byte[pidLen];
+          buf.get(pidBytes);
+          String partitionUniqueId = new String(pidBytes, java.nio.charset.StandardCharsets.UTF_8);
+
+          ByteBuffer slice = comms.getLocalBufferSlice(clientPeer, slotOffset, length);
+          ByteBuf body = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(length);
+          body.writeBytes(slice);
+          
+          chunkPushHandler.pushData(shuffleKey, partitionUniqueId, body, new RpcResponseCallback() {
+            @Override
+            public void onSuccess(ByteBuffer response) {
+              byte statusCode = (response != null && response.remaining() > 0) ? response.get(response.position()) : 0;
+              comms.serverPushComplete(clientPeer, slotOffset, statusCode);
+            }
+            @Override
+            public void onFailure(Throwable e) {
+              comms.serverPushFailed(clientPeer, slotOffset, e.getMessage());
+            }
+          });
+          body.release();
+        } catch (Throwable t) {
+          comms.serverPushFailed(clientPeer, slotOffset, t.getMessage());
+        }
+      });
+    } finally {
+      if (rdmaTrackerEnabled) rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_PUSH_DATA_REQ, System.nanoTime() - t0);
+    }
   }
 
   @Override
-  public void onPushMergedData(String clientPeer, int slotOffset, int length, String shuffleKey, String payload) {
+  public void onPushMergedData(String clientPeer, int slotOffset, int length, byte[] payload) {
     if (chunkPushHandler == null) return;
-    fetchExecutor.submit(() -> {
-      try {
-        String[] subParts = payload.split(";");
-        String[] partitionUniqueIds = subParts[0].split(",");
-        int[] offsets = java.util.Arrays.stream(subParts[1].split(",")).mapToInt(Integer::parseInt).toArray();
-        ByteBuffer slice = comms.getLocalBufferSlice(clientPeer, slotOffset, length);
-        ByteBuf body = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(length);
-        body.writeBytes(slice);
-        
-        chunkPushHandler.pushMergedData(shuffleKey, partitionUniqueIds, offsets, body, new RpcResponseCallback() {
-          @Override
-          public void onSuccess(ByteBuffer response) {
-            byte statusCode = (response != null && response.remaining() > 0) ? response.get(response.position()) : 0;
-            comms.serverPushComplete(clientPeer, slotOffset, statusCode);
+    long t0 = rdmaTrackerEnabled ? System.nanoTime() : 0;
+    try {
+      fetchExecutor.submit(() -> {
+        try {
+          ByteBuffer buf = ByteBuffer.wrap(payload);
+          int keyLen = buf.getInt();
+          byte[] keyBytes = new byte[keyLen];
+          buf.get(keyBytes);
+          String shuffleKey = new String(keyBytes, java.nio.charset.StandardCharsets.UTF_8);
+          
+          int numPids = buf.getInt();
+          String[] partitionUniqueIds = new String[numPids];
+          for (int i = 0; i < numPids; i++) {
+              int pidLen = buf.getInt();
+              byte[] pidBytes = new byte[pidLen];
+              buf.get(pidBytes);
+              partitionUniqueIds[i] = new String(pidBytes, java.nio.charset.StandardCharsets.UTF_8);
           }
-          @Override
-          public void onFailure(Throwable e) {
-            comms.serverPushFailed(clientPeer, slotOffset, e.getMessage());
+          
+          int numOffsets = buf.getInt();
+          int[] offsets = new int[numOffsets];
+          for (int i = 0; i < numOffsets; i++) {
+              offsets[i] = buf.getInt();
           }
-        });
-        body.release();
-      } catch (Throwable t) {
-        comms.serverPushFailed(clientPeer, slotOffset, t.getMessage());
-      }
-    });
+
+          ByteBuffer slice = comms.getLocalBufferSlice(clientPeer, slotOffset, length);
+          ByteBuf body = io.netty.buffer.PooledByteBufAllocator.DEFAULT.directBuffer(length);
+          body.writeBytes(slice);
+          
+          chunkPushHandler.pushMergedData(shuffleKey, partitionUniqueIds, offsets, body, new RpcResponseCallback() {
+            @Override
+            public void onSuccess(ByteBuffer response) {
+              byte statusCode = (response != null && response.remaining() > 0) ? response.get(response.position()) : 0;
+              comms.serverPushComplete(clientPeer, slotOffset, statusCode);
+            }
+            @Override
+            public void onFailure(Throwable e) {
+              comms.serverPushFailed(clientPeer, slotOffset, e.getMessage());
+            }
+          });
+          body.release();
+        } catch (Throwable t) {
+          comms.serverPushFailed(clientPeer, slotOffset, t.getMessage());
+        }
+      });
+    } finally {
+      if (rdmaTrackerEnabled) rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_PUSH_MERGED_DATA_REQ, System.nanoTime() - t0);
+    }
   }
 
   public void shutdown() {
