@@ -84,6 +84,10 @@ public class CommsWrapper implements AutoCloseable {
     nativeFetchChunk(nativePtr, remotePeer, streamId, chunkIndex, callback);
   }
 
+  public void fetchChunksBatched(String remotePeer, long[] streamIds, int[] chunkIndices, ChunkReceivedCallback[] callbacks) {
+    nativeFetchChunksBatched(nativePtr, remotePeer, streamIds, chunkIndices, callbacks);
+  }
+
   private byte[] encodePushDataPayload(String shuffleKey, String partitionUniqueId) {
     byte[] keyBytes = shuffleKey.getBytes(java.nio.charset.StandardCharsets.UTF_8);
     byte[] pidBytes = partitionUniqueId.getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -125,6 +129,14 @@ public class CommsWrapper implements AutoCloseable {
     nativePushData(nativePtr, remotePeer, slotOffset, body.length, payload, callback);
   }
 
+  public void pushDataBatched(String remotePeer, byte[][] bodies, String[] shuffleKeys, String[] partitionUniqueIds, RpcResponseCallback[] callbacks) {
+    byte[][] payloads = new byte[bodies.length][];
+    for(int i = 0; i < bodies.length; i++) {
+        payloads[i] = encodePushDataPayload(shuffleKeys[i], partitionUniqueIds[i]);
+    }
+    nativePushDataBatched(nativePtr, remotePeer, bodies, payloads, callbacks);
+  }
+
   public void pushMergedData(String remotePeer, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
     int slotOffset = nativeAcquirePushSlot(nativePtr);
     ByteBuffer slice = localBuffer.slice();
@@ -132,6 +144,14 @@ public class CommsWrapper implements AutoCloseable {
     slice.put(body);
     byte[] payload = encodePushMergedPayload(shuffleKey, partitionUniqueIds, offsets);
     nativePushMergedData(nativePtr, remotePeer, slotOffset, body.length, payload, callback);
+  }
+
+  public void pushMergedDataBatched(String remotePeer, byte[][] bodies, String[] shuffleKeys, String[][] partitionUniqueIds, int[][] offsets, RpcResponseCallback[] callbacks) {
+    byte[][] payloads = new byte[bodies.length][];
+    for (int i = 0; i < bodies.length; i++) {
+        payloads[i] = encodePushMergedPayload(shuffleKeys[i], partitionUniqueIds[i], offsets[i]);
+    }
+    nativePushMergedDataBatched(nativePtr, remotePeer, bodies, payloads, callbacks);
   }
 
   // --- Server API ---
@@ -291,9 +311,12 @@ public class CommsWrapper implements AutoCloseable {
 
   private static native void nativeInitClientPool(long nativePtr, String peerName, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, long localTokenPtr, long remoteTokenPtr);
   private static native void nativeFetchChunk(long nativePtr, String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback);
+  private static native void nativeFetchChunksBatched(long nativePtr, String remotePeer, long[] streamIds, int[] chunkIndices, ChunkReceivedCallback[] callbacks);
   private static native int nativeAcquirePushSlot(long nativePtr);
   private static native void nativePushData(long nativePtr, String remotePeer, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
+  private static native void nativePushDataBatched(long nativePtr, String remotePeer, byte[][] bodies, byte[][] payloads, RpcResponseCallback[] callbacks);
   private static native void nativePushMergedData(long nativePtr, String remotePeer, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
+  private static native void nativePushMergedDataBatched(long nativePtr, String remotePeer, byte[][] bodies, byte[][] payloads, RpcResponseCallback[] callbacks);
   private static native void nativeReleaseSlot(long nativePtr, int slotOffset);
   
   private static native void nativeInitServerClientPool(long nativePtr, String clientPeer);

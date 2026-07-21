@@ -24,8 +24,8 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
   private final int bootstrapPort;
   private final int oobPort;
   
-  private final int poolSize;
   private final int slotSize;
+  private final long poolSize;
 
   private CommsWrapper comms;
   private ServerSocket listenSock;
@@ -57,7 +57,7 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
     this.slotSize = bufferSize + 4 * 1024 * 1024;
     int pSize = pushSlotSize;
     int fSize = fetchSlotSize == 0 ? this.slotSize : fetchSlotSize;
-    this.poolSize = (pushSlotsCount * pSize) + (fetchSlotsCount * fSize);
+    this.poolSize = ((long) pushSlotsCount * pSize) + ((long) fetchSlotsCount * fSize);
   }
 
   public void registerChunkFetchHandler(ChunkFetchHandler handler) { this.chunkFetchHandler = handler; }
