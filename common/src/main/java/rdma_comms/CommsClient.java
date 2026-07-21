@@ -98,12 +98,9 @@ public class CommsClient {
   private final List<PushMergedReq> pushMergedBatch = new ArrayList<>(12);
 
   private final ReentrantLock lock = new ReentrantLock();
-  private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-      Thread t = new Thread(r, "RDMA-Comms-Scheduler");
-      t.setDaemon(true);
-      return t;
-  });
-  private ScheduledFuture<?> currentTimer = null;
+  private final java.util.concurrent.locks.Condition notEmptyCondition = lock.newCondition();
+  private Thread pollerThread;
+  private long firstStrandedTimeNanos = 0;
 
   private static final int MAX_BATCH = 12;
 
@@ -188,6 +185,43 @@ public class CommsClient {
 
           comms.initClientPool(this.pushSlotsCount, this.pushSlotSize, this.fetchSlotsCount, this.fetchSlotSize, this.localBuffer, this.localToken, this.remoteToken, this.serverPeerName);
           this.running.set(true);
+          
+          this.pollerThread = new Thread(() -> {
+              while (isRunning()) {
+                  List<FetchReq> fBatch = null;
+                  List<PushReq> pBatch = null;
+                  List<PushMergedReq> pmBatch = null;
+                  lock.lock();
+                  try {
+                      while (isRunning() && fetchBatch.isEmpty() && pushBatch.isEmpty() && pushMergedBatch.isEmpty()) {
+                          firstStrandedTimeNanos = 0;
+                          try { notEmptyCondition.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                      }
+                      if (!isRunning()) break;
+
+                      long now = System.nanoTime();
+                      if (firstStrandedTimeNanos == 0) firstStrandedTimeNanos = now;
+
+                      if (now - firstStrandedTimeNanos >= 200_000L) {
+                          if (!fetchBatch.isEmpty()) { fBatch = new ArrayList<>(fetchBatch); fetchBatch.clear(); }
+                          if (!pushBatch.isEmpty()) { pBatch = new ArrayList<>(pushBatch); pushBatch.clear(); }
+                          if (!pushMergedBatch.isEmpty()) { pmBatch = new ArrayList<>(pushMergedBatch); pushMergedBatch.clear(); }
+                          firstStrandedTimeNanos = 0;
+                      }
+                  } finally {
+                      lock.unlock();
+                  }
+
+                  if (fBatch != null || pBatch != null || pmBatch != null) {
+                      if (fBatch != null) flushFetchBatched(fBatch);
+                      if (pBatch != null) flushPushBatched(pBatch);
+                      if (pmBatch != null) flushPushMergedBatched(pmBatch);
+                  }
+              }
+          }, "RDMA-Comms-Poller");
+          this.pollerThread.setDaemon(true);
+          this.pollerThread.start();
+          
           logger.info("Control plane setup complete. Ready for RDMA transfer via JNI.");
         }
       } catch (Exception e) {
@@ -229,13 +263,12 @@ public class CommsClient {
       List<FetchReq> readyToFlush = null;
       lock.lock();
       try {
+          boolean wasEmpty = fetchBatch.isEmpty() && pushBatch.isEmpty() && pushMergedBatch.isEmpty();
           fetchBatch.add(req);
-          scheduleTimerIfNeeded();
+          if (wasEmpty) notEmptyCondition.signal();
+          
           if (fetchBatch.size() >= MAX_BATCH) {
-              if (currentTimer != null && pushBatch.isEmpty() && pushMergedBatch.isEmpty()) {
-                  currentTimer.cancel(false);
-                  currentTimer = null;
-              }
+              if (pushBatch.isEmpty() && pushMergedBatch.isEmpty()) firstStrandedTimeNanos = 0;
               readyToFlush = new ArrayList<>(fetchBatch);
               fetchBatch.clear();
           }
@@ -249,13 +282,12 @@ public class CommsClient {
       List<PushReq> readyToFlush = null;
       lock.lock();
       try {
+          boolean wasEmpty = fetchBatch.isEmpty() && pushBatch.isEmpty() && pushMergedBatch.isEmpty();
           pushBatch.add(req);
-          scheduleTimerIfNeeded();
+          if (wasEmpty) notEmptyCondition.signal();
+          
           if (pushBatch.size() >= MAX_BATCH) {
-              if (currentTimer != null && fetchBatch.isEmpty() && pushMergedBatch.isEmpty()) {
-                  currentTimer.cancel(false);
-                  currentTimer = null;
-              }
+              if (fetchBatch.isEmpty() && pushMergedBatch.isEmpty()) firstStrandedTimeNanos = 0;
               readyToFlush = new ArrayList<>(pushBatch);
               pushBatch.clear();
           }
@@ -269,13 +301,12 @@ public class CommsClient {
       List<PushMergedReq> readyToFlush = null;
       lock.lock();
       try {
+          boolean wasEmpty = fetchBatch.isEmpty() && pushBatch.isEmpty() && pushMergedBatch.isEmpty();
           pushMergedBatch.add(req);
-          scheduleTimerIfNeeded();
+          if (wasEmpty) notEmptyCondition.signal();
+          
           if (pushMergedBatch.size() >= MAX_BATCH) {
-              if (currentTimer != null && fetchBatch.isEmpty() && pushBatch.isEmpty()) {
-                  currentTimer.cancel(false);
-                  currentTimer = null;
-              }
+              if (fetchBatch.isEmpty() && pushBatch.isEmpty()) firstStrandedTimeNanos = 0;
               readyToFlush = new ArrayList<>(pushMergedBatch);
               pushMergedBatch.clear();
           }
@@ -283,30 +314,6 @@ public class CommsClient {
           lock.unlock();
       }
       if (readyToFlush != null) flushPushMergedBatched(readyToFlush);
-  }
-
-  private void scheduleTimerIfNeeded() {
-      if (currentTimer == null || currentTimer.isDone() || currentTimer.isCancelled()) {
-          currentTimer = scheduler.schedule(this::flushFromTimer, 200, TimeUnit.MICROSECONDS);
-      }
-  }
-
-  private void flushFromTimer() {
-      List<FetchReq> fBatch = null;
-      List<PushReq> pBatch = null;
-      List<PushMergedReq> pmBatch = null;
-      lock.lock();
-      try {
-          if (!fetchBatch.isEmpty()) { fBatch = new ArrayList<>(fetchBatch); fetchBatch.clear(); }
-          if (!pushBatch.isEmpty()) { pBatch = new ArrayList<>(pushBatch); pushBatch.clear(); }
-          if (!pushMergedBatch.isEmpty()) { pmBatch = new ArrayList<>(pushMergedBatch); pushMergedBatch.clear(); }
-          currentTimer = null;
-      } finally {
-          lock.unlock();
-      }
-      if (fBatch != null) flushFetchBatched(fBatch);
-      if (pBatch != null) flushPushBatched(pBatch);
-      if (pmBatch != null) flushPushMergedBatched(pmBatch);
   }
 
   private void flushFetchBatched(List<FetchReq> items) {
@@ -380,7 +387,9 @@ public class CommsClient {
 
   public void shutdown() {
     running.set(false);
-    scheduler.shutdownNow();
+    lock.lock();
+    try { notEmptyCondition.signalAll(); } finally { lock.unlock(); }
+    if (pollerThread != null) pollerThread.interrupt();
     if (localToken != null && localBuffer != null) {
       try {
         comms.deregAndFreeMem(localBuffer, localToken);
