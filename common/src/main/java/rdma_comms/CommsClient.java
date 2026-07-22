@@ -66,6 +66,7 @@ public class CommsClient {
   private final String serverIp;
   private final int oobPort;
   private final String serverPeerName;
+  private int serverPeerId = -1;
   private final int slotSize;
   private final int pushSlotsCount;
   private final int fetchSlotsCount;
@@ -172,7 +173,7 @@ public class CommsClient {
           in.readFully(remoteTokenOpaque);
           logger.info("Received all handles and memory metadata.");
 
-          comms.addRemoteEndpoint(serverPeerName, serverHandleOpaque, true);
+          this.serverPeerId = comms.addRemoteEndpoint(serverPeerName, serverHandleOpaque, true);
           comms.connect(serverPeerName);
           logger.info("Connected. Confirming to OOB server...");
           out.writeByte(1);
@@ -183,7 +184,7 @@ public class CommsClient {
           this.localToken = nativeBuffer.token;
           this.remoteToken = comms.getMemToken(remoteTokenOpaque);
 
-          comms.initClientPool(this.pushSlotsCount, this.pushSlotSize, this.fetchSlotsCount, this.fetchSlotSize, this.localBuffer, this.localToken, this.remoteToken, this.serverPeerName);
+          comms.initClientPool(this.pushSlotsCount, this.pushSlotSize, this.fetchSlotsCount, this.fetchSlotSize, this.localBuffer, this.localToken, this.remoteToken, this.serverPeerId);
           this.running.set(true);
           
           this.pollerThread = new Thread(() -> {
@@ -330,7 +331,7 @@ public class CommsClient {
           chunkIndices[i] = r.chunkIndex;
           cbs[i] = r.cb;
       }
-      comms.fetchChunksBatched(serverPeerName, streamIds, chunkIndices, cbs);
+      comms.fetchChunksBatched(serverPeerId, streamIds, chunkIndices, cbs);
       if (rdmaTrackerEnabled) {
           rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_FETCH_CHUNK, System.nanoTime() - t0);
           rdma_comms.RDMATracker.recordBatchSize(rdma_comms.RDMATracker.BatchType.CLIENT_FETCH, items.size());
@@ -353,7 +354,7 @@ public class CommsClient {
           pids[i] = r.pid;
           cbs[i] = r.cb;
       }
-      comms.pushDataBatched(serverPeerName, bodies, keys, pids, cbs);
+      comms.pushDataBatched(serverPeerId, bodies, keys, pids, cbs);
       if (rdmaTrackerEnabled) {
           rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_DATA, System.nanoTime() - t0);
           rdma_comms.RDMATracker.recordBatchSize(rdma_comms.RDMATracker.BatchType.CLIENT_PUSH, items.size());
@@ -378,7 +379,7 @@ public class CommsClient {
           offsets[i] = r.offsets;
           cbs[i] = r.cb;
       }
-      comms.pushMergedDataBatched(serverPeerName, bodies, keys, pids, offsets, cbs);
+      comms.pushMergedDataBatched(serverPeerId, bodies, keys, pids, offsets, cbs);
       if (rdmaTrackerEnabled) {
           rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0);
           rdma_comms.RDMATracker.recordBatchSize(rdma_comms.RDMATracker.BatchType.CLIENT_PUSH, items.size());

@@ -30,6 +30,7 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
   private CommsWrapper comms;
   private ServerSocket listenSock;
   private final Map<String, String> clientPeerNames = new ConcurrentHashMap<>();
+  private final Map<String, Integer> clientPeerIds = new ConcurrentHashMap<>();
   private final AtomicBoolean running = new AtomicBoolean(false);
   public boolean rdmaTrackerEnabled = true;
 
@@ -121,7 +122,9 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
       in.readFully(clientHandleOpaque);
       
       clientPeerNames.put(clientIp, clientPeerName);
-      comms.addRemoteEndpoint(clientPeerName, clientHandleOpaque, true);
+      int clientPeerId = comms.addRemoteEndpoint(clientPeerName, clientHandleOpaque, true);
+      clientPeerIds.put(clientIp, clientPeerId);
+      clientPeerIds.put(clientPeerName, clientPeerId);
 
       CommsWrapper.NativeBuffer nativeBuffer = comms.allocateAndRegMem(poolSize, CommsWrapper.MemoryType.Dram);
       
@@ -194,16 +197,16 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
             @Override
             public void onSuccess(ByteBuffer response) {
               byte statusCode = (response != null && response.remaining() > 0) ? response.get(response.position()) : 0;
-              comms.serverPushComplete(clientPeer, slotOffset, statusCode);
+              comms.serverPushComplete(comms.getPeerId(clientPeer), slotOffset, statusCode);
             }
             @Override
             public void onFailure(Throwable e) {
-              comms.serverPushFailed(clientPeer, slotOffset, e.getMessage());
+              comms.serverPushFailed(comms.getPeerId(clientPeer), slotOffset, e.getMessage());
             }
           });
           body.release();
         } catch (Throwable t) {
-          comms.serverPushFailed(clientPeer, slotOffset, t.getMessage());
+          comms.serverPushFailed(comms.getPeerId(clientPeer), slotOffset, t.getMessage());
         }
       });
     } finally {
@@ -247,16 +250,16 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
             @Override
             public void onSuccess(ByteBuffer response) {
               byte statusCode = (response != null && response.remaining() > 0) ? response.get(response.position()) : 0;
-              comms.serverPushComplete(clientPeer, slotOffset, statusCode);
+              comms.serverPushComplete(comms.getPeerId(clientPeer), slotOffset, statusCode);
             }
             @Override
             public void onFailure(Throwable e) {
-              comms.serverPushFailed(clientPeer, slotOffset, e.getMessage());
+              comms.serverPushFailed(comms.getPeerId(clientPeer), slotOffset, e.getMessage());
             }
           });
           body.release();
         } catch (Throwable t) {
-          comms.serverPushFailed(clientPeer, slotOffset, t.getMessage());
+          comms.serverPushFailed(comms.getPeerId(clientPeer), slotOffset, t.getMessage());
         }
       });
     } finally {

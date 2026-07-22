@@ -50,12 +50,26 @@ public class CommsWrapper implements AutoCloseable {
     return nativeGetEndpointInfo(nativePtr);
   }
 
-  public void addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
-    nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
+  private final Map<String, Integer> peerIdMap = new ConcurrentHashMap<>();
+
+  public int getPeerId(String peerName) {
+    Integer id = peerIdMap.get(peerName);
+    if (id != null) return id;
+    throw new IllegalArgumentException("Unknown peerName: " + peerName + ". Ensure addRemoteEndpoint was called first.");
+  }
+
+  public int addRemoteEndpoint(String peerName, byte[] opaqueHandleBytes, boolean block) {
+    int peerId = nativeAddRemoteEndpoint(nativePtr, peerName, opaqueHandleBytes, block);
+    peerIdMap.put(peerName, peerId);
+    return peerId;
+  }
+
+  public void connect(int peerId) {
+    nativeConnect(nativePtr, peerId);
   }
 
   public void connect(String peerName) {
-    nativeConnect(nativePtr, peerName);
+    connect(getPeerId(peerName));
   }
 
   public NativeBuffer allocateAndRegMem(long size, MemoryType memType) {
@@ -75,17 +89,29 @@ public class CommsWrapper implements AutoCloseable {
   }
 
   // --- Client API ---
-  public void initClientPool(int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, ByteBuffer localBuffer, MemToken localToken, MemToken remoteToken, String serverPeerName) {
+  public void initClientPool(int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, ByteBuffer localBuffer, MemToken localToken, MemToken remoteToken, int serverPeerId) {
     this.localBuffer = localBuffer;
-    nativeInitClientPool(nativePtr, serverPeerName, pushSlots, pushSlotSize, fetchSlots, fetchSlotSize, localToken.getNativePtr(), remoteToken.getNativePtr());
+    nativeInitClientPool(nativePtr, serverPeerId, pushSlots, pushSlotSize, fetchSlots, fetchSlotSize, localToken.getNativePtr(), remoteToken.getNativePtr());
+  }
+
+  public void initClientPool(int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, ByteBuffer localBuffer, MemToken localToken, MemToken remoteToken, String serverPeerName) {
+    initClientPool(pushSlots, pushSlotSize, fetchSlots, fetchSlotSize, localBuffer, localToken, remoteToken, getPeerId(serverPeerName));
+  }
+
+  public void fetchChunk(int peerId, long streamId, int chunkIndex, ChunkReceivedCallback callback) {
+    nativeFetchChunk(nativePtr, peerId, streamId, chunkIndex, callback);
   }
 
   public void fetchChunk(String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback) {
-    nativeFetchChunk(nativePtr, remotePeer, streamId, chunkIndex, callback);
+    fetchChunk(getPeerId(remotePeer), streamId, chunkIndex, callback);
+  }
+
+  public void fetchChunksBatched(int peerId, long[] streamIds, int[] chunkIndices, ChunkReceivedCallback[] callbacks) {
+    nativeFetchChunksBatched(nativePtr, peerId, streamIds, chunkIndices, callbacks);
   }
 
   public void fetchChunksBatched(String remotePeer, long[] streamIds, int[] chunkIndices, ChunkReceivedCallback[] callbacks) {
-    nativeFetchChunksBatched(nativePtr, remotePeer, streamIds, chunkIndices, callbacks);
+    fetchChunksBatched(getPeerId(remotePeer), streamIds, chunkIndices, callbacks);
   }
 
   private byte[] encodePushDataPayload(String shuffleKey, String partitionUniqueId) {
@@ -120,38 +146,54 @@ public class CommsWrapper implements AutoCloseable {
     return buf.array();
   }
 
-  public void pushData(String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+  public void pushData(int peerId, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
     int slotOffset = nativeAcquirePushSlot(nativePtr);
     ByteBuffer slice = localBuffer.slice();
     slice.position(slotOffset);
     slice.put(body);
     byte[] payload = encodePushDataPayload(shuffleKey, partitionUniqueId);
-    nativePushData(nativePtr, remotePeer, slotOffset, body.length, payload, callback);
+    nativePushData(nativePtr, peerId, slotOffset, body.length, payload, callback);
   }
 
-  public void pushDataBatched(String remotePeer, byte[][] bodies, String[] shuffleKeys, String[] partitionUniqueIds, RpcResponseCallback[] callbacks) {
+  public void pushData(String remotePeer, byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+    pushData(getPeerId(remotePeer), body, shuffleKey, partitionUniqueId, callback);
+  }
+
+  public void pushDataBatched(int peerId, byte[][] bodies, String[] shuffleKeys, String[] partitionUniqueIds, RpcResponseCallback[] callbacks) {
     byte[][] payloads = new byte[bodies.length][];
     for(int i = 0; i < bodies.length; i++) {
         payloads[i] = encodePushDataPayload(shuffleKeys[i], partitionUniqueIds[i]);
     }
-    nativePushDataBatched(nativePtr, remotePeer, bodies, payloads, callbacks);
+    nativePushDataBatched(nativePtr, peerId, bodies, payloads, callbacks);
   }
 
-  public void pushMergedData(String remotePeer, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+  public void pushDataBatched(String remotePeer, byte[][] bodies, String[] shuffleKeys, String[] partitionUniqueIds, RpcResponseCallback[] callbacks) {
+    pushDataBatched(getPeerId(remotePeer), bodies, shuffleKeys, partitionUniqueIds, callbacks);
+  }
+
+  public void pushMergedData(int peerId, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
     int slotOffset = nativeAcquirePushSlot(nativePtr);
     ByteBuffer slice = localBuffer.slice();
     slice.position(slotOffset);
     slice.put(body);
     byte[] payload = encodePushMergedPayload(shuffleKey, partitionUniqueIds, offsets);
-    nativePushMergedData(nativePtr, remotePeer, slotOffset, body.length, payload, callback);
+    nativePushMergedData(nativePtr, peerId, slotOffset, body.length, payload, callback);
   }
 
-  public void pushMergedDataBatched(String remotePeer, byte[][] bodies, String[] shuffleKeys, String[][] partitionUniqueIds, int[][] offsets, RpcResponseCallback[] callbacks) {
+  public void pushMergedData(String remotePeer, byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+    pushMergedData(getPeerId(remotePeer), body, shuffleKey, partitionUniqueIds, offsets, callback);
+  }
+
+  public void pushMergedDataBatched(int peerId, byte[][] bodies, String[] shuffleKeys, String[][] partitionUniqueIds, int[][] offsets, RpcResponseCallback[] callbacks) {
     byte[][] payloads = new byte[bodies.length][];
     for (int i = 0; i < bodies.length; i++) {
         payloads[i] = encodePushMergedPayload(shuffleKeys[i], partitionUniqueIds[i], offsets[i]);
     }
-    nativePushMergedDataBatched(nativePtr, remotePeer, bodies, payloads, callbacks);
+    nativePushMergedDataBatched(nativePtr, peerId, bodies, payloads, callbacks);
+  }
+
+  public void pushMergedDataBatched(String remotePeer, byte[][] bodies, String[] shuffleKeys, String[][] partitionUniqueIds, int[][] offsets, RpcResponseCallback[] callbacks) {
+    pushMergedDataBatched(getPeerId(remotePeer), bodies, shuffleKeys, partitionUniqueIds, offsets, callbacks);
   }
 
   // --- Server API ---
@@ -170,16 +212,28 @@ public class CommsWrapper implements AutoCloseable {
     nativeInitServerClientPool(nativePtr, clientPeer);
   }
 
+  public void serverChunkReady(int clientPeerId, long streamId, int chunkIndex, int length, int slotOffset) {
+    nativeServerChunkReady(nativePtr, clientPeerId, streamId, chunkIndex, length, slotOffset);
+  }
+
   public void serverChunkReady(String clientPeer, long streamId, int chunkIndex, int length, int slotOffset) {
-    nativeServerChunkReady(nativePtr, clientPeer, streamId, chunkIndex, length, slotOffset);
+    serverChunkReady(getPeerId(clientPeer), streamId, chunkIndex, length, slotOffset);
+  }
+
+  public void serverPushComplete(int clientPeerId, int slotOffset, byte statusCode) {
+    nativeServerPushComplete(nativePtr, clientPeerId, slotOffset, statusCode);
   }
 
   public void serverPushComplete(String clientPeer, int slotOffset, byte statusCode) {
-    nativeServerPushComplete(nativePtr, clientPeer, slotOffset, statusCode);
+    serverPushComplete(getPeerId(clientPeer), slotOffset, statusCode);
+  }
+
+  public void serverPushFailed(int clientPeerId, int slotOffset, String errorMsg) {
+    nativeServerPushFailed(nativePtr, clientPeerId, slotOffset, errorMsg);
   }
 
   public void serverPushFailed(String clientPeer, int slotOffset, String errorMsg) {
-    nativeServerPushFailed(nativePtr, clientPeer, slotOffset, errorMsg);
+    serverPushFailed(getPeerId(clientPeer), slotOffset, errorMsg);
   }
 
   // --- Support ---
@@ -303,26 +357,26 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeDestroy(long nativePtr);
   private static native void nativeInit(long nativePtr, Map<String, String> params);
   private static native byte[] nativeGetEndpointInfo(long nativePtr);
-  private static native void nativeAddRemoteEndpoint(long nativePtr, String peerName, byte[] opaqueHandleBytes, boolean block);
-  private static native void nativeConnect(long nativePtr, String peerName);
+  private static native int nativeAddRemoteEndpoint(long nativePtr, String peerName, byte[] opaqueHandleBytes, boolean block);
+  private static native void nativeConnect(long nativePtr, int peerId);
   private static native ByteBuffer nativeAllocateAndRegMem(long nativePtr, long size, int memoryType, long[] tokenPtrOut);
   private static native void nativeDeregAndFreeMem(long nativePtr, ByteBuffer buffer, long memTokenPtr);
   private static native long nativeGetMemToken(long nativePtr, byte[] serTok);
 
-  private static native void nativeInitClientPool(long nativePtr, String peerName, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, long localTokenPtr, long remoteTokenPtr);
-  private static native void nativeFetchChunk(long nativePtr, String remotePeer, long streamId, int chunkIndex, ChunkReceivedCallback callback);
-  private static native void nativeFetchChunksBatched(long nativePtr, String remotePeer, long[] streamIds, int[] chunkIndices, ChunkReceivedCallback[] callbacks);
+  private static native void nativeInitClientPool(long nativePtr, int peerId, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, long localTokenPtr, long remoteTokenPtr);
+  private static native void nativeFetchChunk(long nativePtr, int peerId, long streamId, int chunkIndex, ChunkReceivedCallback callback);
+  private static native void nativeFetchChunksBatched(long nativePtr, int peerId, long[] streamIds, int[] chunkIndices, ChunkReceivedCallback[] callbacks);
   private static native int nativeAcquirePushSlot(long nativePtr);
-  private static native void nativePushData(long nativePtr, String remotePeer, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
-  private static native void nativePushDataBatched(long nativePtr, String remotePeer, byte[][] bodies, byte[][] payloads, RpcResponseCallback[] callbacks);
-  private static native void nativePushMergedData(long nativePtr, String remotePeer, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
-  private static native void nativePushMergedDataBatched(long nativePtr, String remotePeer, byte[][] bodies, byte[][] payloads, RpcResponseCallback[] callbacks);
+  private static native void nativePushData(long nativePtr, int peerId, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
+  private static native void nativePushDataBatched(long nativePtr, int peerId, byte[][] bodies, byte[][] payloads, RpcResponseCallback[] callbacks);
+  private static native void nativePushMergedData(long nativePtr, int peerId, int slotOffset, int length, byte[] payload, RpcResponseCallback callback);
+  private static native void nativePushMergedDataBatched(long nativePtr, int peerId, byte[][] bodies, byte[][] payloads, RpcResponseCallback[] callbacks);
   private static native void nativeReleaseSlot(long nativePtr, int slotOffset);
   
   private static native void nativeInitServerClientPool(long nativePtr, String clientPeer);
-  private static native void nativeServerChunkReady(long nativePtr, String clientPeer, long streamId, int chunkIndex, int length, int slotOffset);
-  private static native void nativeServerPushComplete(long nativePtr, String clientPeer, int slotOffset, byte statusCode);
-  private static native void nativeServerPushFailed(long nativePtr, String clientPeer, int slotOffset, String errorMsg);
+  private static native void nativeServerChunkReady(long nativePtr, int clientPeerId, long streamId, int chunkIndex, int length, int slotOffset);
+  private static native void nativeServerPushComplete(long nativePtr, int clientPeerId, int slotOffset, byte statusCode);
+  private static native void nativeServerPushFailed(long nativePtr, int clientPeerId, int slotOffset, String errorMsg);
 
   private static native byte[] nativeMemTokenSerialize(long tokenPtr);
   private static native long nativeMemTokenGetAddress(long tokenPtr);
