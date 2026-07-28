@@ -55,6 +55,11 @@ public class CommsWrapper implements AutoCloseable {
   public int getPeerId(String peerName) {
     Integer id = peerIdMap.get(peerName);
     if (id != null) return id;
+    id = nativeGetPeerId(nativePtr, peerName);
+    if (id >= 0) {
+      peerIdMap.put(peerName, id);
+      return id;
+    }
     throw new IllegalArgumentException("Unknown peerName: " + peerName + ". Ensure addRemoteEndpoint was called first.");
   }
 
@@ -358,6 +363,7 @@ public class CommsWrapper implements AutoCloseable {
   private static native void nativeInit(long nativePtr, Map<String, String> params);
   private static native byte[] nativeGetEndpointInfo(long nativePtr);
   private static native int nativeAddRemoteEndpoint(long nativePtr, String peerName, byte[] opaqueHandleBytes, boolean block);
+  private static native int nativeGetPeerId(long nativePtr, String peerName);
   private static native void nativeConnect(long nativePtr, int peerId);
   private static native ByteBuffer nativeAllocateAndRegMem(long nativePtr, long size, int memoryType, long[] tokenPtrOut);
   private static native void nativeDeregAndFreeMem(long nativePtr, ByteBuffer buffer, long memTokenPtr);
@@ -383,6 +389,36 @@ public class CommsWrapper implements AutoCloseable {
   private static native long nativeMemTokenGetSize(long tokenPtr);
   private static native void nativeMemTokenDelete(long tokenPtr);
 
+  public void startOobServerAsync(int oobPort, long poolSize, String serverPeerName) {
+    nativeStartOobServerAsync(nativePtr, oobPort, poolSize, serverPeerName);
+  }
+
+  public void connectAndRegisterOOBAsync(String serverIp, int oobPort, String localPeerName, String serverPeerName, int pushSlotsCount, int pushSlotSize, int fetchSlotsCount, int fetchSlotSize, RpcResponseCallback callback) {
+    nativeConnectAndRegisterOOBAsync(nativePtr, serverIp, oobPort, localPeerName, serverPeerName, pushSlotsCount, pushSlotSize, fetchSlotsCount, fetchSlotSize, callback);
+  }
+
+  public static void dispatchClientSetupComplete(long nativePtr, RpcResponseCallback callback, byte statusCode, ByteBuffer directBuffer) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      wrapper.localBuffer = directBuffer;
+      callback.onSuccess(directBuffer);
+    }
+  }
+
+  public static void dispatchClientSetupFailed(long nativePtr, RpcResponseCallback callback, String errorMsg) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      callback.onFailure(new java.io.IOException("RDMA setup failed: " + errorMsg));
+    }
+  }
+
+  public static void dispatchServerClientConnected(long nativePtr, String clientPeer, ByteBuffer directBuffer) {
+    CommsWrapper wrapper = getWrapper(nativePtr);
+    if (wrapper != null) {
+      wrapper.initServerClientPool(clientPeer, directBuffer);
+    }
+  }
+
   private static java.io.File createTempDir() throws java.io.IOException {
     java.io.File tempDir = java.io.File.createTempFile("ml_transport_natives-", "");
     if (!tempDir.delete() || !tempDir.mkdir()) throw new java.io.IOException("Failed to create temp directory");
@@ -403,4 +439,7 @@ public class CommsWrapper implements AutoCloseable {
     }
     return destFile;
   }
+
+  private static native void nativeStartOobServerAsync(long nativePtr, int oobPort, long poolSize, String serverPeerName);
+  private static native void nativeConnectAndRegisterOOBAsync(long nativePtr, String serverIp, int oobPort, String localPeerName, String serverPeerName, int pushSlots, int pushSlotSize, int fetchSlots, int fetchSlotSize, RpcResponseCallback callback);
 }

@@ -35,7 +35,30 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
   public boolean rdmaTrackerEnabled = true;
 
   public interface ChunkFetchHandler {
-    int fetchChunk(long streamId, int chunkIndex, ByteBuffer target) throws IOException;
+    default org.apache.celeborn.common.network.buffer.ManagedBuffer getChunkBuffer(long streamId, int chunkIndex) throws IOException {
+      return null;
+    }
+    default int fetchChunk(long streamId, int chunkIndex, ByteBuffer target) throws IOException {
+      org.apache.celeborn.common.network.buffer.ManagedBuffer buf = getChunkBuffer(streamId, chunkIndex);
+      if (buf != null) {
+        return copyBufferToTarget(buf, target, true);
+      }
+      return 0;
+    }
+  }
+
+  public static int copyBufferToTarget(org.apache.celeborn.common.network.buffer.ManagedBuffer buffer, ByteBuffer target, boolean trackerEnabled) throws IOException {
+    long t0 = trackerEnabled ? System.nanoTime() : 0;
+    try {
+      ByteBuffer nioBuf = buffer.nioByteBuffer();
+      int len = nioBuf.remaining();
+      target.put(nioBuf);
+      return len;
+    } finally {
+      if (trackerEnabled) {
+        rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_FETCH_CHUNK_COPY, System.nanoTime() - t0);
+      }
+    }
   }
   public interface ChunkPushHandler {
     void pushData(String shuffleKey, String partitionUniqueId, ByteBuf body, RpcResponseCallback callback) throws IOException;
@@ -89,19 +112,7 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
           t.setDaemon(true); return t;
         });
 
-        new Thread(() -> {
-          try {
-            this.listenSock = new ServerSocket(oobPort);
-            logger.info("Starting OOB server on port {}...", oobPort);
-            while (running.get() && !listenSock.isClosed()) {
-              try {
-                Socket clientSock = listenSock.accept();
-                String clientIp = clientSock.getInetAddress().getHostAddress();
-                registerExecutor.submit(() -> handleClientRegistration(clientSock, clientIp));
-              } catch (IOException e) {}
-            }
-          } catch (IOException e) {}
-        }, "OOB-CommsServer-Accept-Loop").start();
+        comms.startOobServerAsync(oobPort, this.poolSize, localPeerName);
 
       } catch (Exception e) {
         logger.error("Comms initialization failed", e);
@@ -109,42 +120,6 @@ public class CommsServer implements CommsWrapper.ServerJniHandler {
       }
     } finally {
       if (rdmaTrackerEnabled) rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.SERVER_SETUP, System.nanoTime() - t0);
-    }
-  }
-
-  private void handleClientRegistration(Socket clientSock, String clientIp) {
-    try (DataInputStream in = new DataInputStream(clientSock.getInputStream());
-         DataOutputStream out = new DataOutputStream(clientSock.getOutputStream())) {
-      
-      String clientPeerName = in.readUTF();
-      long clientHandleSize = in.readLong();
-      byte[] clientHandleOpaque = new byte[(int) clientHandleSize];
-      in.readFully(clientHandleOpaque);
-      
-      clientPeerNames.put(clientIp, clientPeerName);
-      int clientPeerId = comms.addRemoteEndpoint(clientPeerName, clientHandleOpaque, true);
-      clientPeerIds.put(clientIp, clientPeerId);
-      clientPeerIds.put(clientPeerName, clientPeerId);
-
-      CommsWrapper.NativeBuffer nativeBuffer = comms.allocateAndRegMem(poolSize, CommsWrapper.MemoryType.Dram);
-      
-      // Let C++ know we allocated a pool for this client peer so it tracks slots
-      comms.initServerClientPool(clientPeerName, nativeBuffer.buffer);
-
-      byte[] serverHandleOpaque = comms.getEndpointInfo();
-      out.writeLong(serverHandleOpaque.length);
-      out.write(serverHandleOpaque);
-      out.writeLong(CommsWrapper.getDirectBufferAddress(nativeBuffer.buffer));
-      out.writeLong(this.poolSize);
-      out.write(nativeBuffer.token.serialize());
-      out.flush();
-
-      in.readByte(); // wait for client confirm
-      logger.info("Client JNI connection confirmed for: {}", clientPeerName);
-
-    } catch (Exception e) {
-      logger.error("Failed to register client from IP {}", clientIp, e);
-      try { clientSock.close(); } catch (IOException ignored) {}
     }
   }
 

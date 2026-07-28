@@ -27,7 +27,10 @@ import org.slf4j.LoggerFactory;
 public class CommsClient {
   private static volatile CommsClient _instance = null;
 
+  private final java.util.concurrent.CountDownLatch readyLatch = new java.util.concurrent.CountDownLatch(1);
+
   public static CommsClient getOrCreate(org.apache.celeborn.common.CelebornConf conf) {
+    CommsClient client = null;
     if (_instance == null) {
       synchronized (CommsClient.class) {
         if (_instance == null) {
@@ -35,7 +38,7 @@ public class CommsClient {
           String uniqueClientName = baseName + "_" + java.util.UUID.randomUUID().toString().substring(0, 8);
           long chunkSize = conf.shuffleChunkSize();
           int slotSize = (int) chunkSize + 4 * 1024 * 1024; // 4MB headroom for record boundary overflow
-          CommsClient client = new CommsClient(
+          client = new CommsClient(
               conf.rdmaTransport(),
               uniqueClientName,
               conf.rdmaLocalIp(),
@@ -49,11 +52,16 @@ public class CommsClient {
               (int) conf.rdmaFetchSlotSize()
           );
           client.rdmaTrackerEnabled = conf.rdmaTrackerEnabled();
-          client.setup();
+          client.setupAsync();
           _instance = client;
-          logger.info("EAGER BOOT GATING: JNI CommsClient setup successful and registered!");
+          logger.info("EAGER BOOT GATING: JNI CommsClient setup dispatched asynchronously!");
         }
       }
+    }
+    try {
+      _instance.readyLatch.await();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
     }
     return _instance;
   }
@@ -121,7 +129,7 @@ public class CommsClient {
     this.fetchSlotSize = fetchSlotSize == 0 ? slotSize : fetchSlotSize;
   }
 
-  public void setup() {
+  public void setupAsync() {
     long t0_tracker = rdmaTrackerEnabled ? System.nanoTime() : 0;
     try {
       String transport = "RDMA".equalsIgnoreCase(transportType) ? "1" : "0";
@@ -137,97 +145,37 @@ public class CommsClient {
         comms.init(params);
         logger.info("Comms library initialized.");
 
-        logger.info("Connecting to OOB server {}:{}...", serverIp, oobPort);
-        Socket socket = null;
-        int retries = 0;
-        int maxRetries = 10;
-        while (retries < maxRetries) {
-          try {
-            socket = new Socket(serverIp, oobPort);
-            break;
-          } catch (IOException e) {
-            retries++;
-            logger.warn("Connection failed, retrying in 500ms ({}/{})...", retries, maxRetries);
-            try { Thread.sleep(500); } catch (InterruptedException ie) { throw new IOException("Connection interrupted", ie); }
-          }
-        }
-        if (socket == null) throw new IOException("Failed to connect to OOB server");
+        logger.info("Connecting to OOB server via JNI async {}:{}...", serverIp, oobPort);
+        
+        comms.connectAndRegisterOOBAsync(
+            serverIp, oobPort, localPeerName, serverPeerName,
+            pushSlotsCount, pushSlotSize, fetchSlotsCount, fetchSlotSize,
+            new RpcResponseCallback() {
+                @Override
+                public void onSuccess(ByteBuffer response) {
+                    localBuffer = response;
+                    running.set(true);
+                    serverPeerId = comms.getPeerId(serverPeerName);
+                    pollerThread = new Thread(CommsClient.this::runBatchPoller, "RDMA-Comms-Poller");
+                    pollerThread.setDaemon(true);
+                    pollerThread.start();
+                    logger.info("Control plane async setup complete. Ready for RDMA transfer via JNI.");
+                    readyLatch.countDown();
+                }
 
-        try (Socket finalSocket = socket;
-          DataOutputStream out = new DataOutputStream(finalSocket.getOutputStream());
-          DataInputStream in = new DataInputStream(finalSocket.getInputStream())) {
-          
-          byte[] clientHandleOpaque = comms.getEndpointInfo();
-          out.writeUTF(localPeerName);
-          out.writeLong(clientHandleOpaque.length);
-          out.write(clientHandleOpaque);
-          out.flush();
+                @Override
+                public void onFailure(Throwable e) {
+                    logger.error("Control plane async setup failed via JNI: {}", e.getMessage(), e);
+                    shutdown();
+                    readyLatch.countDown(); // Unblock waiters, but running is false, so next calls will fail normally
+                }
+            }
+        );
 
-          long handleSize = in.readLong();
-          byte[] serverHandleOpaque = new byte[(int) handleSize];
-          in.readFully(serverHandleOpaque);
-
-          long remoteBaseAddress = in.readLong();
-          this.remoteSize = in.readLong();
-          byte[] remoteTokenOpaque = new byte[4096];
-          in.readFully(remoteTokenOpaque);
-          logger.info("Received all handles and memory metadata.");
-
-          this.serverPeerId = comms.addRemoteEndpoint(serverPeerName, serverHandleOpaque, true);
-          comms.connect(serverPeerName);
-          logger.info("Connected. Confirming to OOB server...");
-          out.writeByte(1);
-          out.flush();
-
-          CommsWrapper.NativeBuffer nativeBuffer = comms.allocateAndRegMem(remoteSize, CommsWrapper.MemoryType.Dram);
-          this.localBuffer = nativeBuffer.buffer;
-          this.localToken = nativeBuffer.token;
-          this.remoteToken = comms.getMemToken(remoteTokenOpaque);
-
-          comms.initClientPool(this.pushSlotsCount, this.pushSlotSize, this.fetchSlotsCount, this.fetchSlotSize, this.localBuffer, this.localToken, this.remoteToken, this.serverPeerId);
-          this.running.set(true);
-          
-          this.pollerThread = new Thread(() -> {
-              while (isRunning()) {
-                  List<FetchReq> fBatch = null;
-                  List<PushReq> pBatch = null;
-                  List<PushMergedReq> pmBatch = null;
-                  lock.lock();
-                  try {
-                      while (isRunning() && fetchBatch.isEmpty() && pushBatch.isEmpty() && pushMergedBatch.isEmpty()) {
-                          firstStrandedTimeNanos = 0;
-                          try { notEmptyCondition.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                      }
-                      if (!isRunning()) break;
-
-                      long now = System.nanoTime();
-                      if (firstStrandedTimeNanos == 0) firstStrandedTimeNanos = now;
-
-                      if (now - firstStrandedTimeNanos >= 200_000L) {
-                          if (!fetchBatch.isEmpty()) { fBatch = new ArrayList<>(fetchBatch); fetchBatch.clear(); }
-                          if (!pushBatch.isEmpty()) { pBatch = new ArrayList<>(pushBatch); pushBatch.clear(); }
-                          if (!pushMergedBatch.isEmpty()) { pmBatch = new ArrayList<>(pushMergedBatch); pushMergedBatch.clear(); }
-                          firstStrandedTimeNanos = 0;
-                      }
-                  } finally {
-                      lock.unlock();
-                  }
-
-                  if (fBatch != null || pBatch != null || pmBatch != null) {
-                      if (fBatch != null) flushFetchBatched(fBatch);
-                      if (pBatch != null) flushPushBatched(pBatch);
-                      if (pmBatch != null) flushPushMergedBatched(pmBatch);
-                  }
-              }
-          }, "RDMA-Comms-Poller");
-          this.pollerThread.setDaemon(true);
-          this.pollerThread.start();
-          
-          logger.info("Control plane setup complete. Ready for RDMA transfer via JNI.");
-        }
       } catch (Exception e) {
         logger.error("Control setup failed", e);
         shutdown();
+        readyLatch.countDown();
       }
     } finally {
       if (rdmaTrackerEnabled) {
@@ -236,11 +184,45 @@ public class CommsClient {
     }
   }
 
+  private void runBatchPoller() {
+      while (isRunning()) {
+          List<FetchReq> fBatch = null;
+          List<PushReq> pBatch = null;
+          List<PushMergedReq> pmBatch = null;
+          lock.lock();
+          try {
+              while (isRunning() && fetchBatch.isEmpty() && pushBatch.isEmpty() && pushMergedBatch.isEmpty()) {
+                  firstStrandedTimeNanos = 0;
+                  try { notEmptyCondition.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+              }
+              if (!isRunning()) break;
+
+              long now = System.nanoTime();
+              if (firstStrandedTimeNanos == 0) firstStrandedTimeNanos = now;
+
+              if (now - firstStrandedTimeNanos >= 200_000L) {
+                  if (!fetchBatch.isEmpty()) { fBatch = new ArrayList<>(fetchBatch); fetchBatch.clear(); }
+                  if (!pushBatch.isEmpty()) { pBatch = new ArrayList<>(pushBatch); pushBatch.clear(); }
+                  if (!pushMergedBatch.isEmpty()) { pmBatch = new ArrayList<>(pushMergedBatch); pushMergedBatch.clear(); }
+                  firstStrandedTimeNanos = 0;
+              }
+          } finally {
+              lock.unlock();
+          }
+
+          if (fBatch != null || pBatch != null || pmBatch != null) {
+              if (fBatch != null) flushFetchBatched(fBatch);
+              if (pBatch != null) flushPushBatched(pBatch);
+              if (pmBatch != null) flushPushMergedBatched(pmBatch);
+          }
+      }
+  }
+
   public void fetchChunk(long streamId, int chunkIndex, ChunkReceivedCallback callback) {
     if (isRunning()) {
       enqueueFetch(new FetchReq(streamId, chunkIndex, callback));
     } else {
-      callback.onFailure(chunkIndex, new IllegalStateException("CommsClient is not setup"));
+      callback.onFailure(chunkIndex, new IllegalStateException("CommsClient is not setup (setup failed)"));
     }
   }
 
@@ -248,7 +230,7 @@ public class CommsClient {
     if (isRunning()) {
       enqueuePush(new PushReq(body, shuffleKey, partitionUniqueId, callback));
     } else {
-      callback.onFailure(new IllegalStateException("CommsClient is not setup"));
+      callback.onFailure(new IllegalStateException("CommsClient is not setup (setup failed)"));
     }
   }
 
@@ -256,7 +238,7 @@ public class CommsClient {
     if (isRunning()) {
       enqueuePushMerged(new PushMergedReq(body, shuffleKey, partitionUniqueIds, offsets, callback));
     } else {
-      callback.onFailure(new IllegalStateException("CommsClient is not setup"));
+      callback.onFailure(new IllegalStateException("CommsClient is not setup (setup failed)"));
     }
   }
 
