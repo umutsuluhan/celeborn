@@ -94,12 +94,16 @@ public class CommsClient {
       FetchReq(long s, int c, ChunkReceivedCallback cb) { this.streamId = s; this.chunkIndex = c; this.cb = cb; }
   }
   private static class PushReq {
-      byte[] body; String shuffleKey; String pid; RpcResponseCallback cb;
-      PushReq(byte[] b, String sk, String p, RpcResponseCallback c) { body = b; shuffleKey = sk; pid = p; cb = c; }
+      int slotOffset; int length; String shuffleKey; String pid; RpcResponseCallback cb;
+      PushReq(int slotOffset, int length, String sk, String p, RpcResponseCallback c) {
+          this.slotOffset = slotOffset; this.length = length; shuffleKey = sk; pid = p; cb = c;
+      }
   }
   private static class PushMergedReq {
-      byte[] body; String shuffleKey; String[] pids; int[] offsets; RpcResponseCallback cb;
-      PushMergedReq(byte[] b, String sk, String[] p, int[] o, RpcResponseCallback c) { body = b; shuffleKey = sk; pids = p; offsets = o; cb = c; }
+      int slotOffset; int length; String shuffleKey; String[] pids; int[] offsets; RpcResponseCallback cb;
+      PushMergedReq(int slotOffset, int length, String sk, String[] p, int[] o, RpcResponseCallback c) {
+          this.slotOffset = slotOffset; this.length = length; shuffleKey = sk; pids = p; offsets = o; cb = c;
+      }
   }
 
   private final List<FetchReq> fetchBatch = new ArrayList<>(12);
@@ -226,17 +230,28 @@ public class CommsClient {
     }
   }
 
-  public void pushData(byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+  public int acquirePushSlot() {
     if (isRunning()) {
-      enqueuePush(new PushReq(body, shuffleKey, partitionUniqueId, callback));
+      return comms.acquirePushSlot();
+    }
+    throw new IllegalStateException("CommsClient is not running");
+  }
+
+  public ByteBuffer getLocalBufferSlice(int slotOffset, int length) {
+    return comms.getLocalBufferSlice(slotOffset, length);
+  }
+
+  public void pushData(int slotOffset, int length, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+    if (isRunning()) {
+      enqueuePush(new PushReq(slotOffset, length, shuffleKey, partitionUniqueId, callback));
     } else {
       callback.onFailure(new IllegalStateException("CommsClient is not setup (setup failed)"));
     }
   }
 
-  public void pushMergedData(byte[] body, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+  public void pushMergedData(int slotOffset, int length, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
     if (isRunning()) {
-      enqueuePushMerged(new PushMergedReq(body, shuffleKey, partitionUniqueIds, offsets, callback));
+      enqueuePushMerged(new PushMergedReq(slotOffset, length, shuffleKey, partitionUniqueIds, offsets, callback));
     } else {
       callback.onFailure(new IllegalStateException("CommsClient is not setup (setup failed)"));
     }
@@ -325,18 +340,20 @@ public class CommsClient {
       long t0 = rdmaTrackerEnabled ? System.nanoTime() : 0;
       logger.info("Flushed PUSH batch of size: {}", items.size());
       int n = items.size();
-      byte[][] bodies = new byte[n][];
+      int[] slotOffsets = new int[n];
+      int[] lengths = new int[n];
       String[] keys = new String[n];
       String[] pids = new String[n];
       RpcResponseCallback[] cbs = new RpcResponseCallback[n];
       for (int i=0; i<n; i++) {
           PushReq r = items.get(i);
-          bodies[i] = r.body;
+          slotOffsets[i] = r.slotOffset;
+          lengths[i] = r.length;
           keys[i] = r.shuffleKey;
           pids[i] = r.pid;
           cbs[i] = r.cb;
       }
-      comms.pushDataBatched(serverPeerId, bodies, keys, pids, cbs);
+      comms.pushDataBatched(serverPeerId, slotOffsets, lengths, keys, pids, cbs);
       if (rdmaTrackerEnabled) {
           rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_DATA, System.nanoTime() - t0);
           rdma_comms.RDMATracker.recordBatchSize(rdma_comms.RDMATracker.BatchType.CLIENT_PUSH, items.size());
@@ -348,20 +365,22 @@ public class CommsClient {
       long t0 = rdmaTrackerEnabled ? System.nanoTime() : 0;
       logger.info("Flushed PUSH_MERGED batch of size: {}", items.size());
       int n = items.size();
-      byte[][] bodies = new byte[n][];
+      int[] slotOffsets = new int[n];
+      int[] lengths = new int[n];
       String[] keys = new String[n];
       String[][] pids = new String[n][];
       int[][] offsets = new int[n][];
       RpcResponseCallback[] cbs = new RpcResponseCallback[n];
       for (int i=0; i<n; i++) {
           PushMergedReq r = items.get(i);
-          bodies[i] = r.body;
+          slotOffsets[i] = r.slotOffset;
+          lengths[i] = r.length;
           keys[i] = r.shuffleKey;
           pids[i] = r.pids;
           offsets[i] = r.offsets;
           cbs[i] = r.cb;
       }
-      comms.pushMergedDataBatched(serverPeerId, bodies, keys, pids, offsets, cbs);
+      comms.pushMergedDataBatched(serverPeerId, slotOffsets, lengths, keys, pids, offsets, cbs);
       if (rdmaTrackerEnabled) {
           rdma_comms.RDMATracker.record(rdma_comms.RDMATracker.CallType.CLIENT_PUSH_MERGED_DATA, System.nanoTime() - t0);
           rdma_comms.RDMATracker.recordBatchSize(rdma_comms.RDMATracker.BatchType.CLIENT_PUSH, items.size());

@@ -1305,7 +1305,10 @@ public class ShuffleClientImpl extends ShuffleClient {
             if (rdmaClient != null && conf.rdmaEnabled()) {
               logger.info("RDMA_WRITE_PATH: Pushing shuffle data via RDMA client for shuffleKey {}, partitionUniqueId {}, body length {}.",
                   shuffleKey, loc.getUniqueId(), body.length);
-              rdmaClient.pushData(body, shuffleKey, loc.getUniqueId(), wrappedCallback);
+              int slotOffset = rdmaClient.acquirePushSlot();
+              ByteBuffer slotBuffer = rdmaClient.getLocalBufferSlice(slotOffset, body.length);
+              slotBuffer.put(body);
+              rdmaClient.pushData(slotOffset, body.length, shuffleKey, loc.getUniqueId(), wrappedCallback);
             } else {
               assert dataClientFactory != null;
               TransportClient client =
@@ -1738,12 +1741,13 @@ public class ShuffleClientImpl extends ShuffleClient {
             logger.info("RDMA_WRITE_PATH: Pushing merged shuffle data via RDMA client for shuffleKey {}, partitions {}, total length {}.",
                 shuffleKey, Arrays.toString(partitionUniqueIds), groupedBatchBytesSize);
             
-            // Extract flat byte array from the composite Netty ByteBuf
             io.netty.buffer.ByteBuf nettyBuf = ((NettyManagedBuffer) mergedData.body()).getBuf();
-            byte[] bodyBytes = new byte[nettyBuf.readableBytes()];
-            nettyBuf.getBytes(nettyBuf.readerIndex(), bodyBytes);
+            int len = nettyBuf.readableBytes();
+            int slotOffset = rdmaClient.acquirePushSlot();
+            ByteBuffer slotBuffer = rdmaClient.getLocalBufferSlice(slotOffset, len);
+            nettyBuf.getBytes(nettyBuf.readerIndex(), slotBuffer);
             
-            rdmaClient.pushMergedData(bodyBytes, shuffleKey, partitionUniqueIds, offsets, wrappedCallback);
+            rdmaClient.pushMergedData(slotOffset, len, shuffleKey, partitionUniqueIds, offsets, wrappedCallback);
           } else {
             assert dataClientFactory != null;
             TransportClient client = dataClientFactory.createClient(host, port);
