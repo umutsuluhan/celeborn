@@ -241,17 +241,24 @@ public class CommsClient {
     return comms.getLocalBufferSlice(slotOffset, length);
   }
 
-  public void pushData(int slotOffset, int length, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
+  public void pushData(byte[] body, String shuffleKey, String partitionUniqueId, RpcResponseCallback callback) {
     if (isRunning()) {
-      enqueuePush(new PushReq(slotOffset, length, shuffleKey, partitionUniqueId, callback));
+      int slotOffset = acquirePushSlot();
+      ByteBuffer slotBuffer = getLocalBufferSlice(slotOffset, body.length);
+      slotBuffer.put(body);
+      enqueuePush(new PushReq(slotOffset, body.length, shuffleKey, partitionUniqueId, callback));
     } else {
       callback.onFailure(new IllegalStateException("CommsClient is not setup (setup failed)"));
     }
   }
 
-  public void pushMergedData(int slotOffset, int length, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
+  public void pushMergedData(io.netty.buffer.ByteBuf nettyBuf, String shuffleKey, String[] partitionUniqueIds, int[] offsets, RpcResponseCallback callback) {
     if (isRunning()) {
-      enqueuePushMerged(new PushMergedReq(slotOffset, length, shuffleKey, partitionUniqueIds, offsets, callback));
+      int len = nettyBuf.readableBytes();
+      int slotOffset = acquirePushSlot();
+      ByteBuffer slotBuffer = getLocalBufferSlice(slotOffset, len);
+      nettyBuf.getBytes(nettyBuf.readerIndex(), slotBuffer);
+      enqueuePushMerged(new PushMergedReq(slotOffset, len, shuffleKey, partitionUniqueIds, offsets, callback));
     } else {
       callback.onFailure(new IllegalStateException("CommsClient is not setup (setup failed)"));
     }

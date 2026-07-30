@@ -1305,10 +1305,7 @@ public class ShuffleClientImpl extends ShuffleClient {
             if (rdmaClient != null && conf.rdmaEnabled()) {
               logger.info("RDMA_WRITE_PATH: Pushing shuffle data via RDMA client for shuffleKey {}, partitionUniqueId {}, body length {}.",
                   shuffleKey, loc.getUniqueId(), body.length);
-              int slotOffset = rdmaClient.acquirePushSlot();
-              ByteBuffer slotBuffer = rdmaClient.getLocalBufferSlice(slotOffset, body.length);
-              slotBuffer.put(body);
-              rdmaClient.pushData(slotOffset, body.length, shuffleKey, loc.getUniqueId(), wrappedCallback);
+              rdmaClient.pushData(body, shuffleKey, loc.getUniqueId(), wrappedCallback);
             } else {
               assert dataClientFactory != null;
               TransportClient client =
@@ -1742,12 +1739,7 @@ public class ShuffleClientImpl extends ShuffleClient {
                 shuffleKey, Arrays.toString(partitionUniqueIds), groupedBatchBytesSize);
             
             io.netty.buffer.ByteBuf nettyBuf = ((NettyManagedBuffer) mergedData.body()).getBuf();
-            int len = nettyBuf.readableBytes();
-            int slotOffset = rdmaClient.acquirePushSlot();
-            ByteBuffer slotBuffer = rdmaClient.getLocalBufferSlice(slotOffset, len);
-            nettyBuf.getBytes(nettyBuf.readerIndex(), slotBuffer);
-            
-            rdmaClient.pushMergedData(slotOffset, len, shuffleKey, partitionUniqueIds, offsets, wrappedCallback);
+            rdmaClient.pushMergedData(nettyBuf, shuffleKey, partitionUniqueIds, offsets, wrappedCallback);
           } else {
             assert dataClientFactory != null;
             TransportClient client = dataClientFactory.createClient(host, port);
