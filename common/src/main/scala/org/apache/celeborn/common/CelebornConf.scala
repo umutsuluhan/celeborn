@@ -522,6 +522,8 @@ class CelebornConf(loadDefaults: Boolean) extends Cloneable with Logging with Se
   def rdmaRemotePeerName: String = get(RDMA_REMOTE_PEER_NAME)
   def rdmaEnabled: Boolean = get(RDMA_ENABLED)
   def rdmaTrackerEnabled: Boolean = get(RDMA_TRACKER_ENABLED)
+  def rdmaMaxBatch: Int = get(RDMA_MAX_BATCH)
+  def rdmaStrandedTimeoutNanos: Long = get(RDMA_STRANDED_TIMEOUT_NANOS)
 
 
   def bindPreferIP: Boolean = get(NETWORK_BIND_PREFER_IP)
@@ -2027,6 +2029,23 @@ object CelebornConf extends Logging {
       .doc("Whether to enable RDMA latency tracking for the communication library.")
       .booleanConf
       .createWithDefault(true)
+
+  val RDMA_MAX_BATCH: ConfigEntry[Int] =
+    buildConf("celeborn.rdma.maxBatch")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("Maximum batch size for RDMA fetch/push queue processing in CommsClient.")
+      .intConf
+      .createWithDefault(16)
+
+  val RDMA_STRANDED_TIMEOUT_NANOS: ConfigEntry[Long] =
+    buildConf("celeborn.rdma.strandedTimeoutNanos")
+      .categories("worker", "client")
+      .version("0.6.3-rdma")
+      .doc("Timeout in nanoseconds before flushing stranded batch queues in RDMA CommsClient.")
+      .longConf
+      .createWithDefault(500000L)
+
 
 
   val NETWORK_MEMORY_ALLOCATOR_ALLOW_CACHE: ConfigEntry[Boolean] =

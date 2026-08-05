@@ -49,7 +49,9 @@ public class CommsClient {
               conf.rdmaPushSlotsCount(),
               conf.rdmaFetchSlotsCount(),
               (int) conf.rdmaPushSlotSize(),
-              (int) conf.rdmaFetchSlotSize()
+              (int) conf.rdmaFetchSlotSize(),
+              conf.rdmaMaxBatch(),
+              conf.rdmaStrandedTimeoutNanos()
           );
           client.rdmaTrackerEnabled = conf.rdmaTrackerEnabled();
           client.setupAsync();
@@ -115,11 +117,20 @@ public class CommsClient {
   private Thread pollerThread;
   private long firstStrandedTimeNanos = 0;
 
-  private static final int MAX_BATCH = 12;
+  private final int maxBatch;
+  private final long strandedTimeoutNanos;
 
   public CommsClient(String transportType, String localPeerName, String localIp, String serverIp, 
                 int oobPort, String serverPeerName, int slotSize,
                 int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize) {
+    this(transportType, localPeerName, localIp, serverIp, oobPort, serverPeerName, slotSize,
+         pushSlotsCount, fetchSlotsCount, pushSlotSize, fetchSlotSize, 16, 500000L);
+  }
+
+  public CommsClient(String transportType, String localPeerName, String localIp, String serverIp, 
+                int oobPort, String serverPeerName, int slotSize,
+                int pushSlotsCount, int fetchSlotsCount, int pushSlotSize, int fetchSlotSize,
+                int maxBatch, long strandedTimeoutNanos) {
     this.transportType = transportType;
     this.localPeerName = localPeerName;
     this.localIp = (localIp == null || localIp.isEmpty()) ? org.apache.celeborn.common.util.JavaUtils.getLocalHost() : localIp;
@@ -131,6 +142,8 @@ public class CommsClient {
     this.fetchSlotsCount = fetchSlotsCount;
     this.pushSlotSize = pushSlotSize;
     this.fetchSlotSize = fetchSlotSize == 0 ? slotSize : fetchSlotSize;
+    this.maxBatch = maxBatch;
+    this.strandedTimeoutNanos = strandedTimeoutNanos;
   }
 
   public void setupAsync() {
@@ -204,7 +217,7 @@ public class CommsClient {
               long now = System.nanoTime();
               if (firstStrandedTimeNanos == 0) firstStrandedTimeNanos = now;
 
-              if (now - firstStrandedTimeNanos >= 200_000L) {
+              if (now - firstStrandedTimeNanos >= strandedTimeoutNanos) {
                   if (!fetchBatch.isEmpty()) { fBatch = new ArrayList<>(fetchBatch); fetchBatch.clear(); }
                   if (!pushBatch.isEmpty()) { pBatch = new ArrayList<>(pushBatch); pushBatch.clear(); }
                   if (!pushMergedBatch.isEmpty()) { pmBatch = new ArrayList<>(pushMergedBatch); pushMergedBatch.clear(); }
@@ -272,7 +285,7 @@ public class CommsClient {
           fetchBatch.add(req);
           if (wasEmpty) notEmptyCondition.signal();
           
-          if (fetchBatch.size() >= MAX_BATCH) {
+          if (fetchBatch.size() >= maxBatch) {
               if (pushBatch.isEmpty() && pushMergedBatch.isEmpty()) firstStrandedTimeNanos = 0;
               readyToFlush = new ArrayList<>(fetchBatch);
               fetchBatch.clear();
@@ -291,7 +304,7 @@ public class CommsClient {
           pushBatch.add(req);
           if (wasEmpty) notEmptyCondition.signal();
           
-          if (pushBatch.size() >= MAX_BATCH) {
+          if (pushBatch.size() >= maxBatch) {
               if (fetchBatch.isEmpty() && pushMergedBatch.isEmpty()) firstStrandedTimeNanos = 0;
               readyToFlush = new ArrayList<>(pushBatch);
               pushBatch.clear();
@@ -310,7 +323,7 @@ public class CommsClient {
           pushMergedBatch.add(req);
           if (wasEmpty) notEmptyCondition.signal();
           
-          if (pushMergedBatch.size() >= MAX_BATCH) {
+          if (pushMergedBatch.size() >= maxBatch) {
               if (fetchBatch.isEmpty() && pushBatch.isEmpty()) firstStrandedTimeNanos = 0;
               readyToFlush = new ArrayList<>(pushMergedBatch);
               pushMergedBatch.clear();
